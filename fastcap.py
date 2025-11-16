@@ -1230,7 +1230,8 @@ class EditorWindow(QMainWindow):
         QGuiApplication.clipboard().setPixmap(pix)
 
     def save_to_file(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存图像", "screenshot.png", "PNG (*.png)")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(self, "保存图像", f"screenshot_{ts}.png", "PNG (*.png)")
         if not path:
             return
         # 与复制逻辑一致：使用 itemsBoundingRect 内容区域、以场景 DPR 渲染，避免裁剪缺失或空白，保持清晰度与大小
@@ -1612,7 +1613,8 @@ class RecorderWindow(QMainWindow):
         if not self.frames:
             QMessageBox.information(self, "提示", "没有录到任何帧")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "保存视频", "record.mp4", "MP4 (*.mp4)")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(self, "保存视频", f"record_{ts}.mp4", "MP4 (*.mp4)")
         if not path:
             return
 
@@ -1971,7 +1973,8 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
         if not self.frames:
             QMessageBox.information(self, "提示", "没有录到任何帧")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "保存视频", "record.mp4", "MP4 (*.mp4)")
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(self, "保存视频", f"record_{ts}.mp4", "MP4 (*.mp4)")
         if not path:
             return
 

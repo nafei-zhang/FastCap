@@ -1,10 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_dynamic_libs, copy_metadata
 import os
 
 datas = []
 binaries = []
 hiddenimports = []
+datas += copy_metadata('imageio', recursive=True)
+datas += copy_metadata('imageio-ffmpeg', recursive=True)
 _mode = os.environ.get('FASTCAP_BUILD_MODE', '').lower()
 _lite = (_mode == 'lite')
 _bins = collect_dynamic_libs('PySide6')
