@@ -14,6 +14,29 @@ try:
 except Exception:
     sd = None
 
+try:
+    from imageio_ffmpeg import get_ffmpeg_exe
+    _ffmpeg_exe = None
+    try:
+        _base = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
+        _candidates = [
+            os.path.join(_base, "imageio_ffmpeg", "ffmpeg.exe"),
+            os.path.join(_base, "imageio_ffmpeg", "ffmpeg"),
+            os.path.join(_base, "ffmpeg.exe"),
+            os.path.join(_base, "ffmpeg"),
+        ]
+        for _p in _candidates:
+            if os.path.exists(_p):
+                _ffmpeg_exe = _p
+                break
+    except Exception:
+        _ffmpeg_exe = None
+    if _ffmpeg_exe is None:
+        _ffmpeg_exe = get_ffmpeg_exe()
+    os.environ["IMAGEIO_FFMPEG_EXE"] = _ffmpeg_exe or os.environ.get("IMAGEIO_FFMPEG_EXE", "")
+except Exception:
+    pass
+
 from PySide6.QtCore import Qt, QRect, QPoint, QRectF, QPointF, Signal, QThread, QTimer, QAbstractNativeEventFilter
 from PySide6.QtGui import (
     QAction,
@@ -1654,7 +1677,7 @@ class RecorderWindow(QMainWindow):
                 from imageio_ffmpeg import get_ffmpeg_exe
                 ffmpeg = get_ffmpeg_exe()
             except Exception:
-                ffmpeg = None
+                ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
             try:
                 if self.audio_mode == "both" and hasattr(self.audio_recorder, "tracks"):
                     mic, sysa = self.audio_recorder.tracks()
@@ -2014,7 +2037,7 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
                 from imageio_ffmpeg import get_ffmpeg_exe
                 ffmpeg = get_ffmpeg_exe()
             except Exception:
-                ffmpeg = None
+                ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
             try:
                 if self.audio_mode == "both" and hasattr(self.audio_recorder, "tracks"):
                     mic, sysa = self.audio_recorder.tracks()

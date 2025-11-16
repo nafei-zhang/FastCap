@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_dynamic_libs, copy_metadata
+from imageio_ffmpeg import get_ffmpeg_exe
 import os
 
 datas = []
@@ -24,6 +25,13 @@ def _match(path, names):
     p = path.lower().replace('/', '\\')
     return any(n in p for n in names)
 binaries += [b for b in _bins if _match(b[0], _names_core) or _match(b[0], _names_plugins)]
+
+try:
+    _ffmpeg_path = get_ffmpeg_exe()
+    if _ffmpeg_path:
+        binaries += [(_ffmpeg_path, 'imageio_ffmpeg')]
+except Exception:
+    pass
 
 
 a = Analysis(
