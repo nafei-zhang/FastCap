@@ -17,23 +17,29 @@ except Exception:
 try:
     from imageio_ffmpeg import get_ffmpeg_exe
     _ffmpeg_exe = None
+    _base = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
     try:
-        _base = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
-        _candidates = [
-            os.path.join(_base, "imageio_ffmpeg", "ffmpeg.exe"),
-            os.path.join(_base, "imageio_ffmpeg", "ffmpeg"),
-            os.path.join(_base, "ffmpeg.exe"),
-            os.path.join(_base, "ffmpeg"),
-        ]
-        for _p in _candidates:
-            if os.path.exists(_p):
-                _ffmpeg_exe = _p
+        _dirs = [os.path.join(_base, "imageio_ffmpeg"), _base]
+        for _d in _dirs:
+            if os.path.isdir(_d):
+                for _name in os.listdir(_d):
+                    _n = _name.lower()
+                    if _n.startswith("ffmpeg") and _n.endswith(".exe"):
+                        _p = os.path.join(_d, _name)
+                        if os.path.exists(_p):
+                            _ffmpeg_exe = _p
+                            break
+            if _ffmpeg_exe:
                 break
     except Exception:
         _ffmpeg_exe = None
     if _ffmpeg_exe is None:
-        _ffmpeg_exe = get_ffmpeg_exe()
-    os.environ["IMAGEIO_FFMPEG_EXE"] = _ffmpeg_exe or os.environ.get("IMAGEIO_FFMPEG_EXE", "")
+        try:
+            _ffmpeg_exe = get_ffmpeg_exe()
+        except Exception:
+            _ffmpeg_exe = None
+    if _ffmpeg_exe and os.path.exists(_ffmpeg_exe):
+        os.environ["IMAGEIO_FFMPEG_EXE"] = _ffmpeg_exe
 except Exception:
     pass
 
