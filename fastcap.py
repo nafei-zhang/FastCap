@@ -38,8 +38,36 @@ try:
             _ffmpeg_exe = get_ffmpeg_exe()
         except Exception:
             _ffmpeg_exe = None
+    import shutil
+    _set = False
     if _ffmpeg_exe and os.path.exists(_ffmpeg_exe):
-        os.environ["IMAGEIO_FFMPEG_EXE"] = _ffmpeg_exe
+        try:
+            _exe_dir = os.path.dirname(getattr(sys, "executable", __file__))
+        except Exception:
+            _exe_dir = os.path.dirname(__file__)
+        _targets = []
+        try:
+            _targets.append(_exe_dir)
+        except Exception:
+            pass
+        try:
+            _targets.append(os.path.join(os.environ.get("LOCALAPPDATA", _exe_dir), "FastCap"))
+        except Exception:
+            pass
+        for _t in _targets:
+            try:
+                os.makedirs(_t, exist_ok=True)
+                _dst = os.path.join(_t, "fastcap-ffmpeg.exe")
+                if not os.path.exists(_dst):
+                    shutil.copyfile(_ffmpeg_exe, _dst)
+                if os.path.exists(_dst):
+                    os.environ["IMAGEIO_FFMPEG_EXE"] = _dst
+                    _set = True
+                    break
+            except Exception:
+                continue
+        if not _set:
+            os.environ["IMAGEIO_FFMPEG_EXE"] = _ffmpeg_exe
 except Exception:
     pass
 
@@ -1651,6 +1679,8 @@ class RecorderWindow(QMainWindow):
         tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tmp_video_path = tmp_video.name
         tmp_video.close()
+        fw = int(getattr(self, '_frame_w', self.rect.width()))
+        fh = int(getattr(self, '_frame_h', self.rect.height()))
         save_ok = False
         try:
             import imageio
@@ -1658,8 +1688,6 @@ class RecorderWindow(QMainWindow):
                 writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='libx264')
             except Exception:
                 writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='mpeg4')
-            fw = int(getattr(self, '_frame_w', self.rect.width()))
-            fh = int(getattr(self, '_frame_h', self.rect.height()))
             for f in self.frames:
                 try:
                     if f.shape[1] != fw or f.shape[0] != fh:
@@ -1670,7 +1698,27 @@ class RecorderWindow(QMainWindow):
             writer.close()
             save_ok = True
         except Exception as e:
-            QMessageBox.warning(self, "保存失败", f"写入视频失败：{e}\n临时文件: {tmp_video_path}")
+            try:
+                if cv2 is not None:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(tmp_video_path, fourcc, float(self.fps), (fw, fh))
+                    for f in self.frames:
+                        try:
+                            if f.shape[1] != fw or f.shape[0] != fh:
+                                f = f[:fh, :fw, :]
+                        except Exception:
+                            pass
+                        try:
+                            bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+                        except Exception:
+                            bgr = f[:, :, ::-1]
+                        out.write(bgr)
+                    out.release()
+                    save_ok = True
+                else:
+                    raise e
+            except Exception as e2:
+                QMessageBox.warning(self, "保存失败", f"写入视频失败：{e2}\n临时文件: {tmp_video_path}")
 
         audio_combined = False
         if save_ok and self.audio_enabled and self.audio_recorder:
@@ -2011,6 +2059,8 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
         tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         tmp_video_path = tmp_video.name
         tmp_video.close()
+        fw = int(getattr(self, '_frame_w', self.rect.width()))
+        fh = int(getattr(self, '_frame_h', self.rect.height()))
         save_ok = False
         try:
             import imageio
@@ -2018,8 +2068,6 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
                 writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='libx264')
             except Exception:
                 writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='mpeg4')
-            fw = int(getattr(self, '_frame_w', self.rect.width()))
-            fh = int(getattr(self, '_frame_h', self.rect.height()))
             for f in self.frames:
                 try:
                     if f.shape[1] != fw or f.shape[0] != fh:
@@ -2030,7 +2078,27 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
             writer.close()
             save_ok = True
         except Exception as e:
-            QMessageBox.warning(self, "保存失败", f"写入视频失败：{e}\n临时文件: {tmp_video_path}")
+            try:
+                if cv2 is not None:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    out = cv2.VideoWriter(tmp_video_path, fourcc, float(self.fps), (fw, fh))
+                    for f in self.frames:
+                        try:
+                            if f.shape[1] != fw or f.shape[0] != fh:
+                                f = f[:fh, :fw, :]
+                        except Exception:
+                            pass
+                        try:
+                            bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+                        except Exception:
+                            bgr = f[:, :, ::-1]
+                        out.write(bgr)
+                    out.release()
+                    save_ok = True
+                else:
+                    raise e
+            except Exception as e2:
+                QMessageBox.warning(self, "保存失败", f"写入视频失败：{e2}\n临时文件: {tmp_video_path}")
 
         audio_combined = False
         if save_ok and self.audio_enabled and self.audio_recorder:

@@ -44,7 +44,6 @@ a = Analysis(
         hooksconfig={},
         runtime_hooks=[],
         excludes=[
-            'cv2',
             '_tkinter',
             'selenium',
             'webdriver_manager',
