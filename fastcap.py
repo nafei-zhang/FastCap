@@ -10,6 +10,17 @@ import wave
 import ctypes
 from ctypes import wintypes
 try:
+    if sys.platform.startswith("win"):
+        _h = ctypes.windll.kernel32.CreateMutexW(None, False, "FastCapSingleton")
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            try:
+                ctypes.windll.user32.MessageBoxW(None, "已经打开了此应用程序", "FastCap", 0x00000040)
+            except Exception:
+                pass
+            sys.exit(0)
+except Exception:
+    pass
+try:
     import sounddevice as sd
 except Exception:
     sd = None
@@ -1569,6 +1580,10 @@ class RecorderWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         tb = QToolBar("录像", self)
         self.addToolBar(tb)
+        self._writer = None
+        self._tmp_video_path = None
+        self._use_cv2 = False
+        self._frame_count = 0
         act_start = QAction("开始", self)
         act_start.triggered.connect(self.start_record)
         tb.addAction(act_start)
@@ -1585,8 +1600,8 @@ class RecorderWindow(QMainWindow):
         tb.addSeparator()
         tb.addWidget(QLabel("音频源:"))
         self.audio_combo = QComboBox(self)
-        self.audio_combo.addItems(["两者", "麦克风", "系统", "无"]) 
-        self.audio_combo.setCurrentIndex(0)
+        self.audio_combo.addItems(["麦克风", "扬声器（所听内容）", "麦克风 + 扬声器", "无音频"]) 
+        self.audio_combo.setCurrentIndex(2)
         self.audio_combo.currentTextChanged.connect(self._set_audio_mode)
         try:
             self.audio_combo.setMinimumWidth(96)
@@ -1630,6 +1645,7 @@ class RecorderWindow(QMainWindow):
             return
         self.frames = []
         self.start_time = time.time()
+        self._frame_count = 0
         self.timer.start(int(1000 / self.fps))
         self.statusBar().showMessage("录制中…")
         self._update_title()
@@ -1640,6 +1656,29 @@ class RecorderWindow(QMainWindow):
         except Exception:
             self._frame_w = self.rect.width()
             self._frame_h = self.rect.height()
+        try:
+            t = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            self._tmp_video_path = t.name
+            t.close()
+            import imageio
+            try:
+                self._writer = imageio.get_writer(self._tmp_video_path, fps=self.fps, codec='libx264')
+                self._use_cv2 = False
+            except Exception:
+                try:
+                    self._writer = imageio.get_writer(self._tmp_video_path, fps=self.fps, codec='mpeg4')
+                    self._use_cv2 = False
+                except Exception:
+                    if cv2 is not None:
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        self._writer = cv2.VideoWriter(self._tmp_video_path, fourcc, float(self.fps), (int(self._frame_w), int(self._frame_h)))
+                        self._use_cv2 = True
+                    else:
+                        self._writer = None
+                        self._tmp_video_path = None
+        except Exception:
+            self._writer = None
+            self._tmp_video_path = None
         if self.audio_enabled:
             try:
                 self.audio_recorder = AudioRecorder(source=self.audio_mode)
@@ -1652,7 +1691,26 @@ class RecorderWindow(QMainWindow):
         try:
             pix = capture_region(self.rect)
             arr = qpixmap_to_np_rgb(pix)
-            self.frames.append(arr)
+            if self._writer is not None:
+                try:
+                    fw = int(getattr(self, '_frame_w', self.rect.width()))
+                    fh = int(getattr(self, '_frame_h', self.rect.height()))
+                    if arr.shape[1] != fw or arr.shape[0] != fh:
+                        arr = arr[:fh, :fw, :]
+                    if self._use_cv2:
+                        try:
+                            bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                        except Exception:
+                            bgr = arr[:, :, ::-1]
+                        self._writer.write(bgr)
+                    else:
+                        self._writer.append_data(arr)
+                    self._frame_count += 1
+                except Exception as e:
+                    self.statusBar().showMessage(f"写入帧失败：{e}")
+            else:
+                self.frames.append(arr)
+                self._frame_count += 1
         except Exception as e:
             self.statusBar().showMessage(f"采集失败：{e}")
         self._update_title()
@@ -1660,14 +1718,14 @@ class RecorderWindow(QMainWindow):
     def _update_title(self):
         if self.start_time:
             dur = time.time() - self.start_time
-            self.setWindowTitle(f"屏幕录像 - 录制中（{len(self.frames)}帧，{dur:.1f}s）")
+            self.setWindowTitle(f"屏幕录像 - 录制中（{self._frame_count}帧，{dur:.1f}s）")
         else:
             self.setWindowTitle("屏幕录像")
 
     def stop_record(self):
         if self.timer.isActive():
             self.timer.stop()
-        if not self.frames:
+        if not self.frames and self._writer is None:
             QMessageBox.information(self, "提示", "没有录到任何帧")
             return
         ts = time.strftime("%Y%m%d_%H%M%S")
@@ -1675,50 +1733,61 @@ class RecorderWindow(QMainWindow):
         if not path:
             return
 
-        # 临时视频文件（仅视频流）
-        tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tmp_video_path = tmp_video.name
-        tmp_video.close()
         fw = int(getattr(self, '_frame_w', self.rect.width()))
         fh = int(getattr(self, '_frame_h', self.rect.height()))
         save_ok = False
-        try:
-            import imageio
+        if self._writer is not None:
             try:
-                writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='libx264')
-            except Exception:
-                writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='mpeg4')
-            for f in self.frames:
-                try:
-                    if f.shape[1] != fw or f.shape[0] != fh:
-                        f = f[:fh, :fw, :]
-                except Exception:
-                    pass
-                writer.append_data(f)
-            writer.close()
-            save_ok = True
-        except Exception as e:
-            try:
-                if cv2 is not None:
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    out = cv2.VideoWriter(tmp_video_path, fourcc, float(self.fps), (fw, fh))
-                    for f in self.frames:
-                        try:
-                            if f.shape[1] != fw or f.shape[0] != fh:
-                                f = f[:fh, :fw, :]
-                        except Exception:
-                            pass
-                        try:
-                            bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
-                        except Exception:
-                            bgr = f[:, :, ::-1]
-                        out.write(bgr)
-                    out.release()
-                    save_ok = True
+                if self._use_cv2:
+                    self._writer.release()
                 else:
-                    raise e
-            except Exception as e2:
-                QMessageBox.warning(self, "保存失败", f"写入视频失败：{e2}\n临时文件: {tmp_video_path}")
+                    self._writer.close()
+                save_ok = True
+                tmp_video_path = self._tmp_video_path
+            except Exception as e:
+                QMessageBox.warning(self, "保存失败", f"写入视频失败：{e}\n临时文件: {self._tmp_video_path or ''}")
+                tmp_video_path = self._tmp_video_path or ''
+        else:
+            tmp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+            tmp_video_path = tmp_video.name
+            tmp_video.close()
+            try:
+                import imageio
+                try:
+                    writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='libx264')
+                except Exception:
+                    writer = imageio.get_writer(tmp_video_path, fps=self.fps, codec='mpeg4')
+                for f in self.frames:
+                    try:
+                        if f.shape[1] != fw or f.shape[0] != fh:
+                            f = f[:fh, :fw, :]
+                    except Exception:
+                        pass
+                    writer.append_data(f)
+                writer.close()
+                save_ok = True
+            except Exception as e:
+                try:
+                    if cv2 is not None:
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        out = cv2.VideoWriter(tmp_video_path, fourcc, float(self.fps), (fw, fh))
+                        for f in self.frames:
+                            try:
+                                if f.shape[1] != fw or f.shape[0] != fh:
+                                    f = f[:fh, :fw, :]
+                            except Exception:
+                                pass
+                            try:
+                                bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+                            except Exception:
+                                bgr = f[:, :, ::-1]
+                            out.write(bgr)
+                        out.release()
+                        save_ok = True
+                    else:
+                        raise e
+                except Exception as e2:
+                    QMessageBox.warning(self, "保存失败", f"写入视频失败：{e2}\n临时文件: {tmp_video_path}")
 
         audio_combined = False
         if save_ok and self.audio_enabled and self.audio_recorder:
@@ -1748,19 +1817,25 @@ class RecorderWindow(QMainWindow):
                         write_wav(tmp_sys, sysa, samplerate, 1)
                     if ffmpeg and tmp_mic and tmp_sys:
                         try:
-                            flt = f"[1:a]volume={self.mic_gain:.3f}[a1];[2:a]volume={self.sys_gain:.3f}[a2];[a1][a2]amix=inputs=2:duration=shortest:normalize=1"
+                            flt = f"[1:a]volume={self.mic_gain:.3f}[a1];[2:a]volume={self.sys_gain:.3f}[a2];[a1][a2]amix=inputs=2:duration=shortest:normalize=0[aout]"
+                            th = str(max(1, int(os.cpu_count() or 1)))
                             cmd = [
                                 ffmpeg, "-y",
                                 "-i", tmp_video_path,
                                 "-i", tmp_mic,
                                 "-i", tmp_sys,
                                 "-filter_complex", flt,
+                                "-map", "0:v:0",
+                                "-map", "[aout]",
                                 "-c:v", "copy",
                                 "-c:a", "aac",
+                                "-b:a", "128k",
+                                "-ac", "1",
+                                "-threads", th,
                                 "-shortest",
                                 path,
                             ]
-                            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                             audio_combined = True
                             os.unlink(tmp_video_path)
                             os.unlink(tmp_mic)
@@ -1771,17 +1846,23 @@ class RecorderWindow(QMainWindow):
                         one = tmp_mic or tmp_sys
                         try:
                             g = self.mic_gain if tmp_mic else self.sys_gain
+                            th = str(max(1, int(os.cpu_count() or 1)))
                             cmd = [
                                 ffmpeg, "-y",
                                 "-i", tmp_video_path,
                                 "-i", one,
-                                "-filter:a", f"volume={g:.3f}",
+                                "-filter_complex", f"[1:a]volume={g:.3f}[aout]",
+                                "-map", "0:v:0",
+                                "-map", "[aout]",
                                 "-c:v", "copy",
                                 "-c:a", "aac",
+                                "-b:a", "128k",
+                                "-ac", "1",
+                                "-threads", th,
                                 "-shortest",
                                 path,
                             ]
-                            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                             audio_combined = True
                             os.unlink(tmp_video_path)
                             os.unlink(one)
@@ -1794,17 +1875,23 @@ class RecorderWindow(QMainWindow):
                     write_wav(tmp_audio_path, audio_data, samplerate, channels)
                     try:
                         g = self.mic_gain if self.audio_mode == "mic" else (self.sys_gain if self.audio_mode == "system" else 1.0)
+                        th = str(max(1, int(os.cpu_count() or 1)))
                         cmd = [
                             ffmpeg, "-y",
                             "-i", tmp_video_path,
                             "-i", tmp_audio_path,
-                            "-filter:a", f"volume={g:.3f}",
+                            "-filter_complex", f"[1:a]volume={g:.3f}[aout]",
+                            "-map", "0:v:0",
+                            "-map", "[aout]",
                             "-c:v", "copy",
                             "-c:a", "aac",
+                            "-b:a", "128k",
+                            "-ac", "1",
+                            "-threads", th,
                             "-shortest",
                             path,
                         ]
-                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         audio_combined = True
                         os.unlink(tmp_video_path)
                         os.unlink(tmp_audio_path)
@@ -1834,17 +1921,17 @@ class RecorderWindow(QMainWindow):
 
     def _set_audio_mode(self, text: str):
         m = {
-            "两者": "both",
             "麦克风": "mic",
-            "系统": "system",
-            "无": "none",
+            "扬声器（所听内容）": "system",
+            "麦克风 + 扬声器": "both",
+            "无音频": "none",
         }.get(text, "both")
         self.audio_mode = m
         self.audio_enabled = m != "none"
         msg = {
-            "both": "录制麦克风和系统音频",
-            "mic": "仅录制麦克风音频",
-            "system": "仅录制系统音频",
+            "both": "录制麦克风 + 扬声器",
+            "mic": "仅录制麦克风",
+            "system": "仅录制扬声器",
             "none": "不录制音频",
         }[m]
         self.statusBar().showMessage(msg, 3000)
@@ -1912,18 +1999,51 @@ class AudioRecorder:
                 dev_out = None
                 try:
                     d = sd.default.device
-                    if isinstance(d, (list, tuple)) and len(d) >= 2:
+                    if isinstance(d, (list, tuple)) and len(d) >= 2 and d[1] is not None:
                         dev_out = d[1]
                 except Exception:
                     dev_out = None
+                if dev_out is None:
+                    try:
+                        hostapis = sd.query_hostapis()
+                        wasapi_index = None
+                        for i, ha in enumerate(hostapis):
+                            n = str(ha.get("name", "")).lower()
+                            if "wasapi" in n:
+                                wasapi_index = i
+                                break
+                        if wasapi_index is not None:
+                            devices = sd.query_devices()
+                            pref = None
+                            for i, info in enumerate(devices):
+                                if info.get("hostapi") == wasapi_index and info.get("max_output_channels", 0) > 0:
+                                    nm = str(info.get("name", "")).lower()
+                                    pref = i
+                                    if any(k in nm for k in ["speakers", "headphones", "realtek", "nvidia", "high definition", "hd audio", "输出", "音箱", "耳机"]):
+                                        pref = i
+                                        break
+                            dev_out = pref
+                    except Exception:
+                        dev_out = None
                 extra = None
                 try:
                     extra = getattr(sd, "WasapiSettings")(loopback=True)
                 except Exception:
                     extra = None
+                ch = 2
+                try:
+                    if dev_out is not None:
+                        info = sd.query_devices(dev_out)
+                        ch = max(1, min(2, int(info.get("max_output_channels", 2))))
+                        sr = int(float(info.get("default_samplerate", self.samplerate)))
+                    else:
+                        sr = self.samplerate
+                except Exception:
+                    ch = 2
+                    sr = self.samplerate
                 kwargs = {
-                    "samplerate": self.samplerate,
-                    "channels": 2,
+                    "samplerate": sr,
+                    "channels": ch,
                     "dtype": "float32",
                     "callback": self._sys_cb,
                 }
@@ -1935,13 +2055,7 @@ class AudioRecorder:
                 self._sys_stream.start()
             except Exception:
                 try:
-                    self._sys_stream = sd.InputStream(
-                        samplerate=self.samplerate,
-                        channels=2,
-                        dtype="float32",
-                        callback=self._sys_cb,
-                    )
-                    self._sys_stream.start()
+                    self._sys_stream = None
                 except Exception:
                     self._sys_stream = None
 
@@ -2128,19 +2242,25 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
                         write_wav(tmp_sys, sysa, samplerate, 1)
                     if ffmpeg and tmp_mic and tmp_sys:
                         try:
-                            flt = f"[1:a]volume={self.mic_gain:.3f}[a1];[2:a]volume={self.sys_gain:.3f}[a2];[a1][a2]amix=inputs=2:duration=shortest:normalize=1"
+                            flt = f"[1:a]volume={self.mic_gain:.3f}[a1];[2:a]volume={self.sys_gain:.3f}[a2];[a1][a2]amix=inputs=2:duration=shortest:normalize=0[aout]"
+                            th = str(max(1, int(os.cpu_count() or 1)))
                             cmd = [
                                 ffmpeg, "-y",
                                 "-i", tmp_video_path,
                                 "-i", tmp_mic,
                                 "-i", tmp_sys,
                                 "-filter_complex", flt,
+                                "-map", "0:v:0",
+                                "-map", "[aout]",
                                 "-c:v", "copy",
                                 "-c:a", "aac",
+                                "-b:a", "128k",
+                                "-ac", "1",
+                                "-threads", th,
                                 "-shortest",
                                 path,
                             ]
-                            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                             audio_combined = True
                             os.unlink(tmp_video_path)
                             os.unlink(tmp_mic)
@@ -2151,13 +2271,19 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
                         one = tmp_mic or tmp_sys
                         try:
                             g = self.mic_gain if tmp_mic else self.sys_gain
+                            th = str(max(1, int(os.cpu_count() or 1)))
                             cmd = [
                                 ffmpeg, "-y",
                                 "-i", tmp_video_path,
                                 "-i", one,
-                                "-filter:a", f"volume={g:.3f}",
+                                "-filter_complex", f"[1:a]volume={g:.3f}[aout]",
+                                "-map", "0:v:0",
+                                "-map", "[aout]",
                                 "-c:v", "copy",
                                 "-c:a", "aac",
+                                "-b:a", "128k",
+                                "-ac", "1",
+                                "-threads", th,
                                 "-shortest",
                                 path,
                             ]
@@ -2174,17 +2300,23 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
                     write_wav(tmp_audio_path, audio_data, samplerate, channels)
                     try:
                         g = self.mic_gain if self.audio_mode == "mic" else (self.sys_gain if self.audio_mode == "system" else 1.0)
+                        th = str(max(1, int(os.cpu_count() or 1)))
                         cmd = [
                             ffmpeg, "-y",
                             "-i", tmp_video_path,
                             "-i", tmp_audio_path,
-                            "-filter:a", f"volume={g:.3f}",
+                            "-filter_complex", f"[1:a]volume={g:.3f}[aout]",
+                            "-map", "0:v:0",
+                            "-map", "[aout]",
                             "-c:v", "copy",
                             "-c:a", "aac",
+                            "-b:a", "128k",
+                            "-ac", "1",
+                            "-threads", th,
                             "-shortest",
                             path,
                         ]
-                        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         audio_combined = True
                         os.unlink(tmp_video_path)
                         os.unlink(tmp_audio_path)
@@ -2535,7 +2667,25 @@ class FastCapApp(QApplication):
 
 
 def main():
+    _lock = None
+    try:
+        from PySide6.QtCore import QLockFile, QDir
+        _lp = os.path.join(QDir.tempPath(), "FastCap.lock")
+        _lock = QLockFile(_lp)
+        _lock.setStaleLockTime(0)
+        if not _lock.tryLock(1):
+            try:
+                ctypes.windll.user32.MessageBoxW(None, "已经打开了此应用程序", "FastCap", 0x00000040)
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
     app = FastCapApp(sys.argv)
+    try:
+        setattr(app, "_instance_lock", _lock)
+    except Exception:
+        pass
     sys.exit(app.exec())
 # ----- Image helpers -----
 
