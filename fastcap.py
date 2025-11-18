@@ -82,11 +82,12 @@ try:
 except Exception:
     pass
 
-from PySide6.QtCore import Qt, QRect, QPoint, QRectF, QPointF, Signal, QThread, QTimer, QAbstractNativeEventFilter
+from PySide6.QtCore import Qt, QRect, QPoint, QRectF, QPointF, Signal, QThread, QTimer, QAbstractNativeEventFilter, QUrl
 from PySide6.QtGui import (
     QAction,
     QColor,
     QGuiApplication,
+    QDesktopServices,
     QIcon,
     QImage,
     QPainter,
@@ -119,6 +120,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QWidget,
     QHBoxLayout,
+    QCheckBox,
 )
 
 import mss
@@ -1585,6 +1587,12 @@ class RecorderWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         tb = QToolBar("录像", self)
         self.addToolBar(tb)
+        try:
+            self.addToolBarBreak(Qt.TopToolBarArea)
+        except Exception:
+            pass
+        tb2 = QToolBar("音频设置", self)
+        self.addToolBar(tb2)
         self._writer = None
         self._tmp_video_path = None
         self._use_cv2 = False
@@ -1621,8 +1629,8 @@ class RecorderWindow(QMainWindow):
             pass
         tb.addWidget(self.audio_combo)
 
-        tb.addSeparator()
-        tb.addWidget(QLabel("麦克风增益:"))
+        tb2.addSeparator()
+        tb2.addWidget(QLabel("麦克风增益:"))
         self.mic_gain_combo = QComboBox(self)
         self.mic_gain_combo.addItems(["0.5x", "0.8x", "1.0x", "1.2x", "1.5x", "2.0x"])
         self.mic_gain_combo.setCurrentText("1.0x")
@@ -1631,9 +1639,9 @@ class RecorderWindow(QMainWindow):
             self.mic_gain_combo.setMinimumWidth(96)
         except Exception:
             pass
-        tb.addWidget(self.mic_gain_combo)
+        tb2.addWidget(self.mic_gain_combo)
 
-        tb.addWidget(QLabel("系统增益:"))
+        tb2.addWidget(QLabel("系统增益:"))
         self.sys_gain_combo = QComboBox(self)
         self.sys_gain_combo.addItems(["0.5x", "0.8x", "1.0x", "1.2x", "1.5x", "2.0x"])
         self.sys_gain_combo.setCurrentText("1.0x")
@@ -1642,7 +1650,60 @@ class RecorderWindow(QMainWindow):
             self.sys_gain_combo.setMinimumWidth(96)
         except Exception:
             pass
-        tb.addWidget(self.sys_gain_combo)
+        tb2.addWidget(self.sys_gain_combo)
+
+        self._selected_sys_out = None
+        self.sys_out_combo = QComboBox(self)
+        tb.addWidget(QLabel("系统输出设备:"))
+        tb.addWidget(self.sys_out_combo)
+        try:
+            self.sys_out_combo.setMinimumWidth(160)
+        except Exception:
+            pass
+        try:
+            self.sys_out_combo.currentIndexChanged.connect(self._set_sys_out_device)
+        except Exception:
+            pass
+
+        self.cb_include_comm = QCheckBox("包含通讯/免提设备", self)
+        try:
+            self.cb_include_comm.setChecked(True)
+        except Exception:
+            pass
+        tb.addWidget(self.cb_include_comm)
+        try:
+            self.cb_include_comm.toggled.connect(lambda _: self._populate_sys_outputs())
+        except Exception:
+            pass
+        self._populate_sys_outputs()
+
+        self.cb_prefer_mix = QCheckBox("优先虚拟声卡/立体声混音", self)
+        try:
+            self.cb_prefer_mix.setChecked(True)
+        except Exception:
+            pass
+        tb2.addWidget(self.cb_prefer_mix)
+        try:
+            self.cb_prefer_mix.toggled.connect(lambda _: None)
+        except Exception:
+            pass
+
+        tb2.addSeparator()
+        tb2.addWidget(QLabel("麦克风电平:"))
+        self._mic_level = QProgressBar(self)
+        self._mic_level.setRange(0, 100)
+        self._mic_level.setValue(0)
+        self._mic_level.setFixedWidth(100)
+        tb2.addWidget(self._mic_level)
+        tb2.addWidget(QLabel("系统电平:"))
+        self._sys_level = QProgressBar(self)
+        self._sys_level.setRange(0, 100)
+        self._sys_level.setValue(0)
+        self._sys_level.setFixedWidth(100)
+        tb2.addWidget(self._sys_level)
+        self._level_timer = QTimer(self)
+        self._level_timer.setInterval(200)
+        self._level_timer.timeout.connect(self._update_levels)
 
     def _add_task_item(self, title: str):
         item = QListWidgetItem()
@@ -1812,8 +1873,20 @@ class RecorderWindow(QMainWindow):
             self._tmp_video_path = None
         if self.audio_enabled:
             try:
-                self.audio_recorder = AudioRecorder(source=self.audio_mode)
+                self.audio_recorder = AudioRecorder(source=self.audio_mode, system_device_index=self._selected_sys_out, prefer_stereo_mix=bool(self.cb_prefer_mix.isChecked()), include_comm=bool(self.cb_include_comm.isChecked()))
                 self.audio_recorder.start()
+                try:
+                    self._level_timer.start()
+                except Exception:
+                    pass
+                try:
+                    t = QTimer(self)
+                    t.setSingleShot(True)
+                    t.timeout.connect(self._check_sys_silence_and_fallback)
+                    t.start(2000)
+                    self._fallback_timer = t
+                except Exception:
+                    pass
             except Exception as e:
                 QMessageBox.warning(self, "音频录制失败", f"无法启动音频录制: {e}")
                 self.audio_enabled = False
@@ -1923,6 +1996,16 @@ class RecorderWindow(QMainWindow):
         if save_ok and self.audio_enabled and self.audio_recorder:
             try:
                 audio_data, samplerate, channels = self.audio_recorder.stop()
+                try:
+                    self._level_timer.stop()
+                    self._mic_level.setValue(0)
+                    self._sys_level.setValue(0)
+                    try:
+                        self._fallback_timer.stop()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             except Exception as e:
                 audio_data = None
                 QMessageBox.warning(self, "音频提示", f"停止音频录制失败，将保存纯视频：{e}")
@@ -2083,9 +2166,119 @@ class RecorderWindow(QMainWindow):
         except Exception:
             self.sys_gain = 1.0
 
+    def _populate_sys_outputs(self):
+        self.sys_out_combo.clear()
+        self._sys_out_indices = []
+        self.sys_out_combo.addItem("默认输出设备")
+        self._sys_out_indices.append(None)
+        try:
+            if sd is not None:
+                wasapi_index = None
+                try:
+                    for i, ha in enumerate(sd.query_hostapis()):
+                        n = str(ha.get("name", "")).lower()
+                        if "wasapi" in n:
+                            wasapi_index = i
+                            break
+                except Exception:
+                    wasapi_index = None
+                devices = []
+                try:
+                    devices = sd.query_devices()
+                except Exception:
+                    devices = []
+                for i, info in enumerate(devices):
+                    try:
+                        if (wasapi_index is None or info.get("hostapi") == wasapi_index) and info.get("max_output_channels", 0) > 0:
+                            nm = str(info.get("name", ""))
+                            low = nm.lower()
+                            bad = any(b in low for b in ["hands-free", "ag audio", "hfp", "hsp", "通话", "通信", "telephone", "telephony", "speakerphone"]) and not bool(self.cb_include_comm.isChecked())
+                            if bad:
+                                continue
+                            self.sys_out_combo.addItem(nm)
+                            self._sys_out_indices.append(i)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            self.sys_out_combo.setCurrentIndex(0)
+        except Exception:
+            pass
+
+    def _set_sys_out_device(self, idx: int):
+        try:
+            self._selected_sys_out = self._sys_out_indices[idx]
+        except Exception:
+            self._selected_sys_out = None
+
+    def _update_levels(self):
+        try:
+            mic = None
+            sysa = None
+            try:
+                if self.audio_recorder and self.audio_recorder._buf_mic:
+                    mic = self.audio_recorder._buf_mic[-1]
+            except Exception:
+                mic = None
+            try:
+                if self.audio_recorder and self.audio_recorder._buf_sys:
+                    sysa = self.audio_recorder._buf_sys[-1]
+            except Exception:
+                sysa = None
+            def _val(arr):
+                try:
+                    a = np.abs(arr.astype(np.float32))
+                    m = float(np.mean(a))
+                    v = int(max(0, min(100, round(m * 100))))
+                    return v
+                except Exception:
+                    return 0
+            self._mic_level.setValue(_val(mic) if mic is not None else 0)
+            self._sys_level.setValue(_val(sysa) if sysa is not None else 0)
+        except Exception:
+            try:
+                self._mic_level.setValue(0)
+                self._sys_level.setValue(0)
+            except Exception:
+                pass
+
+    def _check_sys_silence_and_fallback(self):
+        try:
+            v = int(self._sys_level.value())
+        except Exception:
+            v = 0
+        if v > 0:
+            return
+        try:
+            if self.audio_recorder and getattr(self.audio_recorder, "_sys_stream", None):
+                try:
+                    self.audio_recorder._sys_stream.stop()
+                    self.audio_recorder._sys_stream.close()
+                except Exception:
+                    pass
+            try:
+                self.audio_recorder.prefer_stereo_mix = True
+                if getattr(self.audio_recorder, "_sys_stream", None):
+                    try:
+                        self.audio_recorder._sys_stream = None
+                    except Exception:
+                        pass
+                self.audio_recorder._start_system_stereo_mix()
+            except Exception:
+                pass
+            try:
+                v2 = int(self._sys_level.value())
+            except Exception:
+                v2 = 0
+            if v2 <= 0:
+                pass
+        except Exception:
+            pass
+
 
 class AudioRecorder:
-    def __init__(self, samplerate: int = 48000, channels: int = 1, source: str = "both"):
+    def __init__(self, samplerate: int = 48000, channels: int = 1, source: str = "both", system_device_index: int | None = None, prefer_stereo_mix: bool = False, include_comm: bool = True):
         self.samplerate = samplerate
         self.channels = channels
         self.source = source
@@ -2094,6 +2287,9 @@ class AudioRecorder:
         self._buf_sys = []
         self._mic_stream = None
         self._sys_stream = None
+        self.system_device_index = system_device_index
+        self.prefer_stereo_mix = bool(prefer_stereo_mix)
+        self.include_comm = bool(include_comm)
 
     def _mic_cb(self, indata, frames, time_info, status):
         if self._running:
@@ -2131,13 +2327,20 @@ class AudioRecorder:
                 self._mic_stream = None
         if self.source in ("system", "both"):
             try:
-                dev_out = None
+                dev_out = self.system_device_index
                 try:
-                    d = sd.default.device
-                    if isinstance(d, (list, tuple)) and len(d) >= 2 and d[1] is not None:
-                        dev_out = d[1]
+                    if dev_out is None:
+                        d = sd.default.device
+                        if isinstance(d, (list, tuple)) and len(d) >= 2 and d[1] is not None:
+                            dev_out = d[1]
                 except Exception:
                     dev_out = None
+                if self.prefer_stereo_mix:
+                    try:
+                        self._start_system_stereo_mix()
+                        return
+                    except Exception:
+                        pass
                 if dev_out is None:
                     try:
                         hostapis = sd.query_hostapis()
@@ -2150,13 +2353,29 @@ class AudioRecorder:
                         if wasapi_index is not None:
                             devices = sd.query_devices()
                             pref = None
+                            best = None
                             for i, info in enumerate(devices):
-                                if info.get("hostapi") == wasapi_index and info.get("max_output_channels", 0) > 0:
-                                    nm = str(info.get("name", "")).lower()
-                                    pref = i
-                                    if any(k in nm for k in ["speakers", "headphones", "realtek", "nvidia", "high definition", "hd audio", "输出", "音箱", "耳机"]):
-                                        pref = i
-                                        break
+                                try:
+                                    if info.get("hostapi") == wasapi_index and info.get("max_output_channels", 0) > 0:
+                                        nm = str(info.get("name", "")).lower()
+                                        bad = any(b in nm for b in ["hands-free", "ag audio", "hfp", "hsp", "通话", "通信", "telephone", "telephony", "speakerphone"])
+                                        if bad and not self.include_comm:
+                                            continue
+                                        score = 0
+                                        if any(k in nm for k in ["stereo mix", "立体声混音"]):
+                                            score = 100
+                                        elif any(k in nm for k in ["speakers", "realtek", "nvidia", "high definition", "hd audio", "输出", "音箱"]):
+                                            score = 80
+                                        elif any(k in nm for k in ["headphones", "耳机"]):
+                                            score = 60
+                                        else:
+                                            score = 10
+                                        if best is None or score > best[0]:
+                                            best = (score, i)
+                                except Exception:
+                                    pass
+                            if best is not None:
+                                pref = best[1]
                             dev_out = pref
                     except Exception:
                         dev_out = None
@@ -2193,6 +2412,38 @@ class AudioRecorder:
                     self._sys_stream = None
                 except Exception:
                     self._sys_stream = None
+                try:
+                    self._start_system_stereo_mix()
+                except Exception:
+                    pass
+
+    def _start_system_stereo_mix(self):
+        dev_in = None
+        devices = []
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            devices = []
+        for i, info in enumerate(devices):
+            try:
+                if info.get("max_input_channels", 0) > 0:
+                    nm = str(info.get("name", "")).lower()
+                    if any(k in nm for k in ["stereo mix", "立体声混音", "cable output", "vb-audio", "voicemeeter"]):
+                        dev_in = i
+                        break
+            except Exception:
+                pass
+        if dev_in is None:
+            raise RuntimeError("no stereo mix")
+        kwargs = {
+            "samplerate": self.samplerate,
+            "channels": 2,
+            "dtype": "float32",
+            "callback": self._sys_cb,
+            "device": dev_in,
+        }
+        self._sys_stream = sd.InputStream(**kwargs)
+        self._sys_stream.start()
 
     def stop(self):
         self._running = False
