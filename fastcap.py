@@ -9,6 +9,7 @@ import pyautogui
 import wave
 import ctypes
 from ctypes import wintypes
+import threading
 try:
     if sys.platform.startswith("win"):
         _h = ctypes.windll.kernel32.CreateMutexW(None, False, "FastCapSingleton")
@@ -24,6 +25,11 @@ try:
     import sounddevice as sd
 except Exception:
     sd = None
+
+try:
+    import soundcard as sc
+except Exception:
+    sc = None
 
 try:
     from imageio_ffmpeg import get_ffmpeg_exe
@@ -1614,6 +1620,7 @@ class RecorderWindow(QMainWindow):
         self.audio_recorder = None
         self.audio_mode = "both"
         self.audio_enabled = True
+        self.audio_backend = "auto"
         self.mic_gain = 1.0
         self.sys_gain = 1.0
         from PySide6.QtWidgets import QLabel, QComboBox
@@ -1628,6 +1635,28 @@ class RecorderWindow(QMainWindow):
         except Exception:
             pass
         tb.addWidget(self.audio_combo)
+
+        tb.addSeparator()
+        tb.addWidget(QLabel("采集后端:"))
+        self.backend_combo = QComboBox(self)
+        self.backend_combo.addItems(["自动", "FFmpeg(dshow)", "WASAPI", "SoundCard"])
+        self.backend_combo.setCurrentIndex(0)
+        try:
+            self.backend_combo.setMinimumWidth(120)
+        except Exception:
+            pass
+        def _set_backend(text: str):
+            m = {"自动": "auto", "FFmpeg(dshow)": "dshow", "WASAPI": "wasapi", "SoundCard": "soundcard"}
+            self.audio_backend = m.get(text, "auto")
+            try:
+                self._populate_sys_outputs()
+            except Exception:
+                pass
+        try:
+            self.backend_combo.currentTextChanged.connect(_set_backend)
+        except Exception:
+            pass
+        tb.addWidget(self.backend_combo)
 
         tb2.addSeparator()
         tb2.addWidget(QLabel("麦克风增益:"))
@@ -1751,7 +1780,7 @@ class RecorderWindow(QMainWindow):
             def run(self):
                 ok = False
                 try:
-                    p = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                    p = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore", bufsize=1)
                     last = -1
                     if p.stdout is not None:
                         for line in p.stdout:
@@ -1873,7 +1902,7 @@ class RecorderWindow(QMainWindow):
             self._tmp_video_path = None
         if self.audio_enabled:
             try:
-                self.audio_recorder = AudioRecorder(source=self.audio_mode, system_device_index=self._selected_sys_out, prefer_stereo_mix=bool(self.cb_prefer_mix.isChecked()), include_comm=bool(self.cb_include_comm.isChecked()))
+                self.audio_recorder = AudioRecorder(source=self.audio_mode, system_device_index=self._selected_sys_out, prefer_stereo_mix=bool(self.cb_prefer_mix.isChecked()), include_comm=bool(self.cb_include_comm.isChecked()), backend=self.audio_backend)
                 self.audio_recorder.start()
                 try:
                     self._level_timer.start()
@@ -2172,6 +2201,57 @@ class RecorderWindow(QMainWindow):
         self.sys_out_combo.addItem("默认输出设备")
         self._sys_out_indices.append(None)
         try:
+            if getattr(self, "audio_backend", "auto") == "dshow":
+                names = []
+                ffmpeg = None
+                try:
+                    from imageio_ffmpeg import get_ffmpeg_exe
+                    ffmpeg = get_ffmpeg_exe()
+                except Exception:
+                    ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
+                if ffmpeg and os.path.exists(ffmpeg):
+                    try:
+                        p = subprocess.Popen([ffmpeg, "-list_devices", "true", "-f", "dshow", "-i", "dummy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        out, err = p.communicate(timeout=5)
+                        try:
+                            s_err = (err.decode("utf-8", "ignore") if err else "")
+                        except Exception:
+                            try:
+                                s_err = (err.decode("mbcs", "ignore") if err else "")
+                            except Exception:
+                                s_err = ""
+                        lines = s_err.splitlines()
+                        take = False
+                        for ln in lines:
+                            s = ln.strip()
+                            if "DirectShow audio devices" in s:
+                                take = True
+                                continue
+                            if "DirectShow video devices" in s:
+                                take = False
+                            if take and '"' in s:
+                                try:
+                                    nm = s.split('"', 2)[1]
+                                    if nm:
+                                        names.append(nm)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        names = []
+                for nm in names:
+                    try:
+                        self.sys_out_combo.addItem(nm)
+                        self._sys_out_indices.append(nm)
+                    except Exception:
+                        pass
+                try:
+                    self.sys_out_combo.setCurrentIndex(0)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        try:
             if sd is not None:
                 wasapi_index = None
                 try:
@@ -2278,7 +2358,7 @@ class RecorderWindow(QMainWindow):
 
 
 class AudioRecorder:
-    def __init__(self, samplerate: int = 48000, channels: int = 1, source: str = "both", system_device_index: int | None = None, prefer_stereo_mix: bool = False, include_comm: bool = True):
+    def __init__(self, samplerate: int = 48000, channels: int = 1, source: str = "both", system_device_index: int | None = None, prefer_stereo_mix: bool = False, include_comm: bool = True, backend: str = "auto"):
         self.samplerate = samplerate
         self.channels = channels
         self.source = source
@@ -2290,6 +2370,13 @@ class AudioRecorder:
         self.system_device_index = system_device_index
         self.prefer_stereo_mix = bool(prefer_stereo_mix)
         self.include_comm = bool(include_comm)
+        self.backend = backend
+        self._sc_rec = None
+        self._sc_thread = None
+        self._sc_running = False
+        self._dshow_proc = None
+        self._dshow_thread = None
+        self._dshow_running = False
 
     def _mic_cb(self, indata, frames, time_info, status):
         if self._running:
@@ -2312,7 +2399,10 @@ class AudioRecorder:
             self._running = False
             self._mic_stream = None
             self._sys_stream = None
-            return
+            if sc is None or self.source not in ("system", "both"):
+                return
+        self._running = True
+        # 麦克风优先用sounddevice
         self._running = True
         if self.source in ("mic", "both"):
             try:
@@ -2326,6 +2416,122 @@ class AudioRecorder:
             except Exception:
                 self._mic_stream = None
         if self.source in ("system", "both"):
+            if (self.backend == "dshow"):
+                try:
+                    dev_name = None
+                    if isinstance(self.system_device_index, str):
+                        dev_name = self.system_device_index
+                    if not dev_name:
+                        raise RuntimeError("no dshow device selected")
+                    ffmpeg = None
+                    try:
+                        from imageio_ffmpeg import get_ffmpeg_exe
+                        ffmpeg = get_ffmpeg_exe()
+                    except Exception:
+                        ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
+                    if not ffmpeg or not os.path.exists(ffmpeg):
+                        raise RuntimeError("ffmpeg not found")
+                    cmd = [
+                        ffmpeg,
+                        "-hide_banner", "-loglevel", "warning",
+                        "-f", "dshow", "-i", f"audio={dev_name}",
+                        "-ac", "1", "-ar", str(int(self.samplerate)),
+                        "-f", "f32le", "pipe:1",
+                    ]
+                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    self._dshow_proc = p
+                    self._dshow_running = True
+                    def _dloop():
+                        bs = int(max(1024, (self.samplerate // 5))) * 4
+                        while self._dshow_running and p.stdout:
+                            try:
+                                buf = p.stdout.read(bs)
+                                if not buf:
+                                    break
+                                try:
+                                    arr = np.frombuffer(buf, dtype=np.float32)
+                                    if arr.size > 0:
+                                        arr = arr.reshape(-1, 1)
+                                        self._buf_sys.append(arr)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                break
+                    th = threading.Thread(target=_dloop, daemon=True)
+                    th.start()
+                    self._dshow_thread = th
+                    return
+                except Exception:
+                    pass
+            if (self.backend == "soundcard" or (self.backend == "auto" and sc is not None)):
+                try:
+                    spk = None
+                    target_name = None
+                    try:
+                        if self.system_device_index is not None and sd is not None:
+                            info = sd.query_devices(self.system_device_index)
+                            target_name = str(info.get("name", "")).lower()
+                    except Exception:
+                        target_name = None
+                    spks = []
+                    try:
+                        spks = getattr(sc, "all_speakers")()
+                    except Exception:
+                        try:
+                            spks = getattr(sc, "get_speakers")()
+                        except Exception:
+                            spks = []
+                    best = None
+                    for s in spks:
+                        try:
+                            nm = str(getattr(s, "name", "")).lower()
+                            bad = any(b in nm for b in ["hands-free", "ag audio", "hfp", "hsp", "通话", "通信", "speakerphone", "telephone"]) and not self.include_comm
+                            if bad:
+                                continue
+                            score = 0
+                            if target_name and target_name in nm:
+                                score = 100
+                            elif any(k in nm for k in ["cable output", "vb-audio", "voicemeeter", "stereo mix", "立体声混音"]):
+                                score = 90
+                            elif any(k in nm for k in ["speakers", "realtek", "nvidia", "high definition", "hd audio", "输出", "音箱", "headphones", "耳机"]):
+                                score = 60
+                            else:
+                                score = 10
+                            if best is None or score > best[0]:
+                                best = (score, s)
+                        except Exception:
+                            pass
+                    try:
+                        if best is None:
+                            spk = getattr(sc, "default_speaker")()
+                        else:
+                            spk = best[1]
+                    except Exception:
+                        spk = None
+                    if spk is not None:
+                        self._sc_rec = spk.recorder(samplerate=self.samplerate, channels=2, blocksize=0, loopback=True)
+                        self._sc_running = True
+                        def _loop():
+                            while self._sc_running:
+                                try:
+                                    n = int(max(128, self.samplerate // 5))
+                                    data = self._sc_rec.record(n)
+                                    if data is not None:
+                                        try:
+                                            if data.ndim == 2 and data.shape[1] > 1:
+                                                mono = data.mean(axis=1, keepdims=True)
+                                            else:
+                                                mono = data
+                                            self._buf_sys.append(mono.astype(np.float32))
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
+                        self._sc_thread = threading.Thread(target=_loop, daemon=True)
+                        self._sc_thread.start()
+                        return
+                except Exception:
+                    pass
             try:
                 dev_out = self.system_device_index
                 try:
@@ -2457,6 +2663,36 @@ class AudioRecorder:
             if self._sys_stream:
                 self._sys_stream.stop()
                 self._sys_stream.close()
+        except Exception:
+            pass
+        try:
+            if self._dshow_proc:
+                try:
+                    self._dshow_running = False
+                except Exception:
+                    pass
+                try:
+                    self._dshow_proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    self._dshow_proc.kill()
+                except Exception:
+                    pass
+                try:
+                    self._dshow_proc = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self._sc_running:
+                self._sc_running = False
+                try:
+                    if self._sc_rec:
+                        self._sc_rec.close()
+                except Exception:
+                    pass
         except Exception:
             pass
         self._mic_stream = None
