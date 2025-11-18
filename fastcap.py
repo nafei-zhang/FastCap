@@ -114,6 +114,11 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QLabel,
     QComboBox,
+    QListWidget,
+    QListWidgetItem,
+    QProgressBar,
+    QWidget,
+    QHBoxLayout,
 )
 
 import mss
@@ -1584,6 +1589,13 @@ class RecorderWindow(QMainWindow):
         self._tmp_video_path = None
         self._use_cv2 = False
         self._frame_count = 0
+        self._merge_workers = []
+        self._tasks = QListWidget(self)
+        try:
+            self._tasks.hide()
+        except Exception:
+            pass
+        self.setCentralWidget(self._tasks)
         act_start = QAction("开始", self)
         act_start.triggered.connect(self.start_record)
         tb.addAction(act_start)
@@ -1631,6 +1643,125 @@ class RecorderWindow(QMainWindow):
         except Exception:
             pass
         tb.addWidget(self.sys_gain_combo)
+
+    def _add_task_item(self, title: str):
+        item = QListWidgetItem()
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lbl = QLabel(title, w)
+        bar = QProgressBar(w)
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        lay.addWidget(lbl)
+        lay.addWidget(bar)
+        item.setSizeHint(w.sizeHint())
+        self._tasks.addItem(item)
+        self._tasks.setItemWidget(item, w)
+        try:
+            self._tasks.show()
+        except Exception:
+            pass
+        return item, bar
+
+    def _remove_task_item(self, item: QListWidgetItem):
+        try:
+            row = self._tasks.row(item)
+            if row >= 0:
+                self._tasks.takeItem(row)
+        except Exception:
+            pass
+        try:
+            if self._tasks.count() == 0:
+                self._tasks.hide()
+        except Exception:
+            pass
+
+    def _start_merge_task(self, cmd: list, duration_s: float, output_path: str, cleanup_on_success: list, cleanup_on_fail: list, tmp_video_path: str):
+        item, bar = self._add_task_item(f"合成并保存: {os.path.basename(output_path)}")
+        class _Worker(QThread):
+            progress = Signal(int)
+            finished = Signal(bool, str)
+            def __init__(self, cmd: list, duration: float, out: str):
+                super().__init__()
+                self.cmd = cmd
+                self.duration = max(0.001, float(duration))
+                self.out = out
+            def run(self):
+                ok = False
+                try:
+                    p = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                    last = -1
+                    if p.stdout is not None:
+                        for line in p.stdout:
+                            try:
+                                s = line.strip()
+                            except Exception:
+                                s = ""
+                            if not s:
+                                continue
+                            if s.startswith("out_time_ms="):
+                                try:
+                                    ms = int(s.split("=", 1)[1])
+                                    sec = ms / 1000000.0
+                                    val = int(max(0, min(100, round(sec / self.duration * 100))))
+                                    if val != last:
+                                        last = val
+                                        self.progress.emit(val)
+                                except Exception:
+                                    pass
+                            elif s.startswith("progress="):
+                                if "end" in s:
+                                    ok = True
+                        p.wait()
+                        if p.returncode == 0:
+                            ok = True
+                    else:
+                        p.wait()
+                        ok = (p.returncode == 0)
+                except Exception:
+                    ok = False
+                self.finished.emit(ok, self.out)
+        w = _Worker(cmd, duration_s, output_path)
+        w.progress.connect(lambda v: bar.setValue(int(v)))
+        def _on_done(ok: bool, out: str):
+            if ok:
+                for pth in cleanup_on_success:
+                    try:
+                        if pth and os.path.exists(pth):
+                            os.unlink(pth)
+                    except Exception:
+                        pass
+                QMessageBox.information(self, "完成", "视频已保存")
+                self.statusBar().showMessage("已保存")
+                self._remove_task_item(item)
+            else:
+                for pth in cleanup_on_fail:
+                    try:
+                        if pth and os.path.exists(pth):
+                            os.unlink(pth)
+                    except Exception:
+                        pass
+                try:
+                    if os.path.exists(out):
+                        os.unlink(out)
+                except Exception:
+                    pass
+                try:
+                    if tmp_video_path and os.path.exists(tmp_video_path):
+                        os.replace(tmp_video_path, out)
+                        QMessageBox.information(self, "完成", "已保存纯视频")
+                        self.statusBar().showMessage("已保存")
+                    else:
+                        QMessageBox.critical(self, "保存失败", "合成失败且无法移动临时文件")
+                except Exception as e:
+                    QMessageBox.critical(self, "保存失败", f"移动文件失败：{e}")
+                    if tmp_video_path:
+                        QMessageBox.information(self, "临时保留", f"视频临时文件保留在：{tmp_video_path}")
+                self._remove_task_item(item)
+        w.finished.connect(_on_done)
+        self._merge_workers.append(w)
+        w.start()
 
     def _bbox(self):
         return {
@@ -1789,7 +1920,6 @@ class RecorderWindow(QMainWindow):
                 except Exception as e2:
                     QMessageBox.warning(self, "保存失败", f"写入视频失败：{e2}\n临时文件: {tmp_video_path}")
 
-        audio_combined = False
         if save_ok and self.audio_enabled and self.audio_recorder:
             try:
                 audio_data, samplerate, channels = self.audio_recorder.stop()
@@ -1802,6 +1932,7 @@ class RecorderWindow(QMainWindow):
             except Exception:
                 ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
             try:
+                started = False
                 if self.audio_mode == "both" and hasattr(self.audio_recorder, "tracks"):
                     mic, sysa = self.audio_recorder.tracks()
                     tmp_mic = tmp_sys = None
@@ -1816,70 +1947,37 @@ class RecorderWindow(QMainWindow):
                         t2.close()
                         write_wav(tmp_sys, sysa, samplerate, 1)
                     if ffmpeg and tmp_mic and tmp_sys:
-                        try:
-                            flt = f"[1:a]volume={self.mic_gain:.3f}[a1];[2:a]volume={self.sys_gain:.3f}[a2];[a1][a2]amix=inputs=2:duration=shortest:normalize=0[aout]"
-                            th = str(max(1, int(os.cpu_count() or 1)))
-                            cmd = [
-                                ffmpeg, "-y",
-                                "-i", tmp_video_path,
-                                "-i", tmp_mic,
-                                "-i", tmp_sys,
-                                "-filter_complex", flt,
-                                "-map", "0:v:0",
-                                "-map", "[aout]",
-                                "-c:v", "copy",
-                                "-c:a", "aac",
-                                "-b:a", "128k",
-                                "-ac", "1",
-                                "-threads", th,
-                                "-shortest",
-                                path,
-                            ]
-                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            audio_combined = True
-                            os.unlink(tmp_video_path)
-                            os.unlink(tmp_mic)
-                            os.unlink(tmp_sys)
-                        except Exception:
-                            audio_combined = False
-                    elif ffmpeg and (tmp_mic or tmp_sys):
-                        one = tmp_mic or tmp_sys
-                        try:
-                            g = self.mic_gain if tmp_mic else self.sys_gain
-                            th = str(max(1, int(os.cpu_count() or 1)))
-                            cmd = [
-                                ffmpeg, "-y",
-                                "-i", tmp_video_path,
-                                "-i", one,
-                                "-filter_complex", f"[1:a]volume={g:.3f}[aout]",
-                                "-map", "0:v:0",
-                                "-map", "[aout]",
-                                "-c:v", "copy",
-                                "-c:a", "aac",
-                                "-b:a", "128k",
-                                "-ac", "1",
-                                "-threads", th,
-                                "-shortest",
-                                path,
-                            ]
-                            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            audio_combined = True
-                            os.unlink(tmp_video_path)
-                            os.unlink(one)
-                        except Exception:
-                            audio_combined = False
-                elif audio_data is not None and audio_data.size > 0 and ffmpeg:
-                    tmp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                    tmp_audio_path = tmp_audio.name
-                    tmp_audio.close()
-                    write_wav(tmp_audio_path, audio_data, samplerate, channels)
-                    try:
-                        g = self.mic_gain if self.audio_mode == "mic" else (self.sys_gain if self.audio_mode == "system" else 1.0)
+                        flt = f"[1:a]volume={self.mic_gain:.3f}[a1];[2:a]volume={self.sys_gain:.3f}[a2];[a1][a2]amix=inputs=2:duration=shortest:normalize=0[aout]"
                         th = str(max(1, int(os.cpu_count() or 1)))
                         cmd = [
                             ffmpeg, "-y",
                             "-i", tmp_video_path,
-                            "-i", tmp_audio_path,
+                            "-i", tmp_mic,
+                            "-i", tmp_sys,
+                            "-filter_complex", flt,
+                            "-map", "0:v:0",
+                            "-map", "[aout]",
+                            "-c:v", "copy",
+                            "-c:a", "aac",
+                            "-b:a", "128k",
+                            "-ac", "1",
+                            "-threads", th,
+                            "-shortest",
+                            "-progress", "pipe:1",
+                            "-nostats",
+                            path,
+                        ]
+                        total_s = max(0.001, float((self._frame_count or len(self.frames)) / max(1, self.fps)))
+                        self._start_merge_task(cmd, total_s, path, [tmp_video_path, tmp_mic, tmp_sys], [tmp_mic, tmp_sys], tmp_video_path)
+                        started = True
+                    elif ffmpeg and (tmp_mic or tmp_sys):
+                        one = tmp_mic or tmp_sys
+                        g = self.mic_gain if tmp_mic else self.sys_gain
+                        th = str(max(1, int(os.cpu_count() or 1)))
+                        cmd = [
+                            ffmpeg, "-y",
+                            "-i", tmp_video_path,
+                            "-i", one,
                             "-filter_complex", f"[1:a]volume={g:.3f}[aout]",
                             "-map", "0:v:0",
                             "-map", "[aout]",
@@ -1889,31 +1987,68 @@ class RecorderWindow(QMainWindow):
                             "-ac", "1",
                             "-threads", th,
                             "-shortest",
+                            "-progress", "pipe:1",
+                            "-nostats",
                             path,
                         ]
-                        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        audio_combined = True
-                        os.unlink(tmp_video_path)
-                        os.unlink(tmp_audio_path)
+                        total_s = max(0.001, float((self._frame_count or len(self.frames)) / max(1, self.fps)))
+                        self._start_merge_task(cmd, total_s, path, [tmp_video_path, one], [one], tmp_video_path)
+                        started = True
+                elif audio_data is not None and audio_data.size > 0 and ffmpeg:
+                    tmp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    tmp_audio_path = tmp_audio.name
+                    tmp_audio.close()
+                    write_wav(tmp_audio_path, audio_data, samplerate, channels)
+                    g = self.mic_gain if self.audio_mode == "mic" else (self.sys_gain if self.audio_mode == "system" else 1.0)
+                    th = str(max(1, int(os.cpu_count() or 1)))
+                    cmd = [
+                        ffmpeg, "-y",
+                        "-i", tmp_video_path,
+                        "-i", tmp_audio_path,
+                        "-filter_complex", f"[1:a]volume={g:.3f}[aout]",
+                        "-map", "0:v:0",
+                        "-map", "[aout]",
+                        "-c:v", "copy",
+                        "-c:a", "aac",
+                        "-b:a", "128k",
+                        "-ac", "1",
+                        "-threads", th,
+                        "-shortest",
+                        "-progress", "pipe:1",
+                        "-nostats",
+                        path,
+                    ]
+                    total_s = max(0.001, float((self._frame_count or len(self.frames)) / max(1, self.fps)))
+                    self._start_merge_task(cmd, total_s, path, [tmp_video_path, tmp_audio_path], [tmp_audio_path], tmp_video_path)
+                    started = True
+                if not started:
+                    try:
+                        if os.path.exists(path):
+                            os.unlink(path)
                     except Exception:
-                        audio_combined = False
+                        pass
+                    try:
+                        os.replace(tmp_video_path, path)
+                        QMessageBox.information(self, "完成", "视频已保存")
+                        self.statusBar().showMessage("已保存")
+                    except Exception as e:
+                        QMessageBox.critical(self, "保存失败", f"移动文件失败：{e}")
+                        QMessageBox.information(self, "临时保留", f"视频临时文件保留在：{tmp_video_path}")
+                        return
             except Exception:
-                audio_combined = False
-
-        if save_ok and not audio_combined:
-            try:
-                if os.path.exists(path):
-                    os.unlink(path)
-                os.replace(tmp_video_path, path)
-            except Exception as e:
-                QMessageBox.critical(self, "保存失败", f"移动文件失败：{e}")
-                QMessageBox.information(self, "临时保留", f"视频临时文件保留在：{tmp_video_path}")
-                return
-
-        if save_ok:
-            QMessageBox.information(self, "完成", "视频已保存")
-            self.statusBar().showMessage("已保存")
-
+                try:
+                    if os.path.exists(path):
+                        os.unlink(path)
+                except Exception:
+                    pass
+                try:
+                    os.replace(tmp_video_path, path)
+                    QMessageBox.information(self, "完成", "视频已保存")
+                    self.statusBar().showMessage("已保存")
+                except Exception as e:
+                    QMessageBox.critical(self, "保存失败", f"移动文件失败：{e}")
+                    QMessageBox.information(self, "临时保留", f"视频临时文件保留在：{tmp_video_path}")
+                    return
         # 重置状态
         self.frames = []
         self.start_time = None
