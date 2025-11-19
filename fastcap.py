@@ -1620,7 +1620,6 @@ class RecorderWindow(QMainWindow):
         self.audio_recorder = None
         self.audio_mode = "both"
         self.audio_enabled = True
-        self.audio_backend = "auto"
         self.mic_gain = 1.0
         self.sys_gain = 1.0
         from PySide6.QtWidgets import QLabel, QComboBox
@@ -1635,28 +1634,6 @@ class RecorderWindow(QMainWindow):
         except Exception:
             pass
         tb.addWidget(self.audio_combo)
-
-        tb.addSeparator()
-        tb.addWidget(QLabel("采集后端:"))
-        self.backend_combo = QComboBox(self)
-        self.backend_combo.addItems(["自动", "FFmpeg(dshow)", "WASAPI", "SoundCard"])
-        self.backend_combo.setCurrentIndex(0)
-        try:
-            self.backend_combo.setMinimumWidth(120)
-        except Exception:
-            pass
-        def _set_backend(text: str):
-            m = {"自动": "auto", "FFmpeg(dshow)": "dshow", "WASAPI": "wasapi", "SoundCard": "soundcard"}
-            self.audio_backend = m.get(text, "auto")
-            try:
-                self._populate_sys_outputs()
-            except Exception:
-                pass
-        try:
-            self.backend_combo.currentTextChanged.connect(_set_backend)
-        except Exception:
-            pass
-        tb.addWidget(self.backend_combo)
 
         tb2.addSeparator()
         tb2.addWidget(QLabel("麦克风增益:"))
@@ -1717,6 +1694,13 @@ class RecorderWindow(QMainWindow):
         except Exception:
             pass
 
+        tb2.addSeparator()
+        # 添加音频帮助按钮
+        from PySide6.QtWidgets import QPushButton
+        help_btn = QPushButton("音频设置帮助", self)
+        help_btn.clicked.connect(self._show_audio_help)
+        tb2.addWidget(help_btn)
+        
         tb2.addSeparator()
         tb2.addWidget(QLabel("麦克风电平:"))
         self._mic_level = QProgressBar(self)
@@ -1780,7 +1764,7 @@ class RecorderWindow(QMainWindow):
             def run(self):
                 ok = False
                 try:
-                    p = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore", bufsize=1)
+                    p = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
                     last = -1
                     if p.stdout is not None:
                         for line in p.stdout:
@@ -1902,8 +1886,29 @@ class RecorderWindow(QMainWindow):
             self._tmp_video_path = None
         if self.audio_enabled:
             try:
-                self.audio_recorder = AudioRecorder(source=self.audio_mode, system_device_index=self._selected_sys_out, prefer_stereo_mix=bool(self.cb_prefer_mix.isChecked()), include_comm=bool(self.cb_include_comm.isChecked()), backend=self.audio_backend)
+                self.audio_recorder = AudioRecorder(source=self.audio_mode, system_device_index=self._selected_sys_out, prefer_stereo_mix=bool(self.cb_prefer_mix.isChecked()), include_comm=bool(self.cb_include_comm.isChecked()), backend="auto")
                 self.audio_recorder.start()
+                # 显示音频设备信息
+                try:
+                    device_info = self.audio_recorder.get_device_info()
+                    info_parts = []
+                    if device_info.get("mic"):
+                        info_parts.append(device_info["mic"])
+                    if device_info.get("system"):
+                        info_parts.append(device_info["system"])
+                    if info_parts:
+                        info_msg = "\n".join(info_parts)
+                        self.statusBar().showMessage(f"音频设备: {info_msg}", 5000)
+                    if device_info.get("errors"):
+                        errors = "\n".join(device_info["errors"])
+                        if self.audio_mode in ("system", "both"):
+                            QMessageBox.warning(self, "音频设备警告", 
+                                f"系统音频录制可能失败:\n{errors}\n\n解决方法:\n" +
+                                "1. 在Windows声音设置中启用'立体声混音'\n" +
+                                "2. 勾选'优先虚拟声卡/立体声混音'选项\n" +
+                                "3. 安装虚拟声卡(如VB-Audio Cable)")
+                except Exception:
+                    pass
                 try:
                     self._level_timer.start()
                 except Exception:
@@ -1917,7 +1922,7 @@ class RecorderWindow(QMainWindow):
                 except Exception:
                     pass
             except Exception as e:
-                QMessageBox.warning(self, "音频录制失败", f"无法启动音频录制: {e}")
+                QMessageBox.warning(self, "音频录制失败", f"无法启动音频录制: {e}\n\n如需录制系统声音，请确保:\n1. 已在Windows声音设置中启用'立体声混音'\n2. 或安装虚拟声卡(如VB-Audio Cable)")
                 self.audio_enabled = False
 
     def _capture_frame(self):
@@ -2166,6 +2171,53 @@ class RecorderWindow(QMainWindow):
         self.start_time = None
         self._update_title()
 
+    def _show_audio_help(self):
+        """显示音频设置帮助信息"""
+        help_text = """
+<h3>录制会议/系统声音设置指南</h3>
+
+<p><b>问题：</b>录屏时只能录制麦克风声音，无法录制会议中其他人的声音。</p>
+
+<p><b>原因：</b>Windows默认不允许录制扬声器播放的内容（即您听到的声音）。</p>
+
+<h4>解决方法1：启用立体声混音（推荐）</h4>
+<ol>
+<li>右键点击任务栏音量图标，选择<b>“声音设置”</b></li>
+<li>切换到<b>“录制”</b>选项卡</li>
+<li>右键空白处，勾选<b>“显示已禁用的设备”</b></li>
+<li>找到<b>“立体声混音”(Stereo Mix)</b>，右键选择<b>“启用”</b></li>
+<li>在FastCap中勾选<b>“优先虚拟声卡/立体声混音”</b>选项</li>
+</ol>
+
+<h4>解决方法2：安装虚拟声卡（如果立体声混音不可用）</h4>
+<ol>
+<li>下载并安装<b>VB-Audio Virtual Cable</b>：<br>
+<a href="https://vb-audio.com/Cable/">https://vb-audio.com/Cable/</a></li>
+<li>安装后会在声音设备中显示虚拟设备</li>
+<li>在FastCap中选择对应的虚拟音频设备</li>
+</ol>
+
+<h4>使用提示</h4>
+<ul>
+<li>音频源选择<b>“扬声器（所听内容）”</b>或<b>“麦克风 + 扬声器”</b></li>
+<li>观察<b>系统电平</b>进度条，确认有音频输入</li>
+<li>开始录制时会显示使用的音频设备</li>
+</ul>
+
+<p><b>注意：</b>如果仍无法录制系统声音，请检查会议软件的音频输出设置，确保声音正常播放。</p>
+        """
+        from PySide6.QtWidgets import QMessageBox, QTextBrowser
+        msg = QMessageBox(self)
+        msg.setWindowTitle("音频设置帮助")
+        msg.setIcon(QMessageBox.Information)
+        text_browser = QTextBrowser()
+        text_browser.setHtml(help_text)
+        text_browser.setOpenExternalLinks(True)
+        text_browser.setMinimumWidth(600)
+        text_browser.setMinimumHeight(400)
+        msg.layout().addWidget(text_browser, 0, 0, 1, msg.layout().columnCount())
+        msg.exec()
+
     def _set_audio_mode(self, text: str):
         m = {
             "麦克风": "mic",
@@ -2200,57 +2252,6 @@ class RecorderWindow(QMainWindow):
         self._sys_out_indices = []
         self.sys_out_combo.addItem("默认输出设备")
         self._sys_out_indices.append(None)
-        try:
-            if getattr(self, "audio_backend", "auto") == "dshow":
-                names = []
-                ffmpeg = None
-                try:
-                    from imageio_ffmpeg import get_ffmpeg_exe
-                    ffmpeg = get_ffmpeg_exe()
-                except Exception:
-                    ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
-                if ffmpeg and os.path.exists(ffmpeg):
-                    try:
-                        p = subprocess.Popen([ffmpeg, "-list_devices", "true", "-f", "dshow", "-i", "dummy"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                        out, err = p.communicate(timeout=5)
-                        try:
-                            s_err = (err.decode("utf-8", "ignore") if err else "")
-                        except Exception:
-                            try:
-                                s_err = (err.decode("mbcs", "ignore") if err else "")
-                            except Exception:
-                                s_err = ""
-                        lines = s_err.splitlines()
-                        take = False
-                        for ln in lines:
-                            s = ln.strip()
-                            if "DirectShow audio devices" in s:
-                                take = True
-                                continue
-                            if "DirectShow video devices" in s:
-                                take = False
-                            if take and '"' in s:
-                                try:
-                                    nm = s.split('"', 2)[1]
-                                    if nm:
-                                        names.append(nm)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        names = []
-                for nm in names:
-                    try:
-                        self.sys_out_combo.addItem(nm)
-                        self._sys_out_indices.append(nm)
-                    except Exception:
-                        pass
-                try:
-                    self.sys_out_combo.setCurrentIndex(0)
-                except Exception:
-                    pass
-                return
-        except Exception:
-            pass
         try:
             if sd is not None:
                 wasapi_index = None
@@ -2374,9 +2375,6 @@ class AudioRecorder:
         self._sc_rec = None
         self._sc_thread = None
         self._sc_running = False
-        self._dshow_proc = None
-        self._dshow_thread = None
-        self._dshow_running = False
 
     def _mic_cb(self, indata, frames, time_info, status):
         if self._running:
@@ -2395,10 +2393,13 @@ class AudioRecorder:
     def start(self):
         self._buf_mic.clear()
         self._buf_sys.clear()
+        self._device_info = {"mic": None, "system": None, "errors": []}
         if sd is None:
             self._running = False
             self._mic_stream = None
             self._sys_stream = None
+            self._device_info["errors"].append("sounddevice库不可用")
+            # 如果soundcard可用，系统声道仍可尝试
             if sc is None or self.source not in ("system", "both"):
                 return
         self._running = True
@@ -2406,6 +2407,8 @@ class AudioRecorder:
         self._running = True
         if self.source in ("mic", "both"):
             try:
+                default_mic = sd.query_devices(kind='input')
+                self._device_info["mic"] = f"麦克风: {default_mic.get('name', '未知')}" if default_mic else "麦克风: 默认设备"
                 self._mic_stream = sd.InputStream(
                     samplerate=self.samplerate,
                     channels=1,
@@ -2413,56 +2416,10 @@ class AudioRecorder:
                     callback=self._mic_cb,
                 )
                 self._mic_stream.start()
-            except Exception:
+            except Exception as e:
                 self._mic_stream = None
+                self._device_info["errors"].append(f"麦克风启动失败: {e}")
         if self.source in ("system", "both"):
-            if (self.backend == "dshow"):
-                try:
-                    dev_name = None
-                    if isinstance(self.system_device_index, str):
-                        dev_name = self.system_device_index
-                    if not dev_name:
-                        raise RuntimeError("no dshow device selected")
-                    ffmpeg = None
-                    try:
-                        from imageio_ffmpeg import get_ffmpeg_exe
-                        ffmpeg = get_ffmpeg_exe()
-                    except Exception:
-                        ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
-                    if not ffmpeg or not os.path.exists(ffmpeg):
-                        raise RuntimeError("ffmpeg not found")
-                    cmd = [
-                        ffmpeg,
-                        "-hide_banner", "-loglevel", "warning",
-                        "-f", "dshow", "-i", f"audio={dev_name}",
-                        "-ac", "1", "-ar", str(int(self.samplerate)),
-                        "-f", "f32le", "pipe:1",
-                    ]
-                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-                    self._dshow_proc = p
-                    self._dshow_running = True
-                    def _dloop():
-                        bs = int(max(1024, (self.samplerate // 5))) * 4
-                        while self._dshow_running and p.stdout:
-                            try:
-                                buf = p.stdout.read(bs)
-                                if not buf:
-                                    break
-                                try:
-                                    arr = np.frombuffer(buf, dtype=np.float32)
-                                    if arr.size > 0:
-                                        arr = arr.reshape(-1, 1)
-                                        self._buf_sys.append(arr)
-                                except Exception:
-                                    pass
-                            except Exception:
-                                break
-                    th = threading.Thread(target=_dloop, daemon=True)
-                    th.start()
-                    self._dshow_thread = th
-                    return
-                except Exception:
-                    pass
             if (self.backend == "soundcard" or (self.backend == "auto" and sc is not None)):
                 try:
                     spk = None
@@ -2481,6 +2438,8 @@ class AudioRecorder:
                             spks = getattr(sc, "get_speakers")()
                         except Exception:
                             spks = []
+                    if not spks:
+                        self._device_info["errors"].append("soundcard: 未找到扬声器设备")
                     best = None
                     for s in spks:
                         try:
@@ -2492,9 +2451,11 @@ class AudioRecorder:
                             if target_name and target_name in nm:
                                 score = 100
                             elif any(k in nm for k in ["cable output", "vb-audio", "voicemeeter", "stereo mix", "立体声混音"]):
+                                score = 95
+                            elif self.include_comm and any(k in nm for k in ["communications", "通话", "通信", "speakerphone", "hands-free", "ag audio", "hfp", "hsp"]):
                                 score = 90
                             elif any(k in nm for k in ["speakers", "realtek", "nvidia", "high definition", "hd audio", "输出", "音箱", "headphones", "耳机"]):
-                                score = 60
+                                score = 80
                             else:
                                 score = 10
                             if best is None or score > best[0]:
@@ -2509,6 +2470,8 @@ class AudioRecorder:
                     except Exception:
                         spk = None
                     if spk is not None:
+                        spk_name = str(getattr(spk, "name", "未知设备"))
+                        self._device_info["system"] = f"系统音频(soundcard): {spk_name}"
                         self._sc_rec = spk.recorder(samplerate=self.samplerate, channels=2, blocksize=0, loopback=True)
                         self._sc_running = True
                         def _loop():
@@ -2530,8 +2493,8 @@ class AudioRecorder:
                         self._sc_thread = threading.Thread(target=_loop, daemon=True)
                         self._sc_thread.start()
                         return
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._device_info["errors"].append(f"soundcard loopback失败: {e}")
             try:
                 dev_out = self.system_device_index
                 try:
@@ -2556,6 +2519,8 @@ class AudioRecorder:
                             if "wasapi" in n:
                                 wasapi_index = i
                                 break
+                        if wasapi_index is None:
+                            self._device_info["errors"].append("未找到WASAPI音频API")
                         if wasapi_index is not None:
                             devices = sd.query_devices()
                             pref = None
@@ -2570,10 +2535,12 @@ class AudioRecorder:
                                         score = 0
                                         if any(k in nm for k in ["stereo mix", "立体声混音"]):
                                             score = 100
+                                        elif self.include_comm and any(k in nm for k in ["communications", "通话", "通信", "speakerphone", "hands-free", "ag audio", "hfp", "hsp"]):
+                                            score = 90
                                         elif any(k in nm for k in ["speakers", "realtek", "nvidia", "high definition", "hd audio", "输出", "音箱"]):
                                             score = 80
                                         elif any(k in nm for k in ["headphones", "耳机"]):
-                                            score = 60
+                                            score = 70
                                         else:
                                             score = 10
                                         if best is None or score > best[0]:
@@ -2611,17 +2578,23 @@ class AudioRecorder:
                     kwargs["device"] = dev_out
                 if extra is not None:
                     kwargs["extra_settings"] = extra
+                try:
+                    dev_info = sd.query_devices(dev_out) if dev_out is not None else sd.query_devices(kind='output')
+                    self._device_info["system"] = f"系统音频(WASAPI loopback): {dev_info.get('name', '默认设备')}"
+                except Exception:
+                    self._device_info["system"] = "系统音频(WASAPI loopback): 尝试默认设备"
                 self._sys_stream = sd.InputStream(**kwargs)
                 self._sys_stream.start()
-            except Exception:
+            except Exception as e:
                 try:
                     self._sys_stream = None
                 except Exception:
                     self._sys_stream = None
+                self._device_info["errors"].append(f"WASAPI loopback失败: {e}")
                 try:
                     self._start_system_stereo_mix()
-                except Exception:
-                    pass
+                except Exception as e2:
+                    self._device_info["errors"].append(f"立体声混音回退失败: {e2}")
 
     def _start_system_stereo_mix(self):
         dev_in = None
@@ -2640,7 +2613,12 @@ class AudioRecorder:
             except Exception:
                 pass
         if dev_in is None:
-            raise RuntimeError("no stereo mix")
+            raise RuntimeError("未找到立体声混音设备。请在Windows声音设置中启用'立体声混音'或安装虚拟声卡(如VB-Audio Cable)")
+        try:
+            dev_info = sd.query_devices(dev_in)
+            self._device_info["system"] = f"系统音频(立体声混音): {dev_info.get('name', '未知')}"
+        except Exception:
+            self._device_info["system"] = "系统音频(立体声混音)"
         kwargs = {
             "samplerate": self.samplerate,
             "channels": 2,
@@ -2663,26 +2641,6 @@ class AudioRecorder:
             if self._sys_stream:
                 self._sys_stream.stop()
                 self._sys_stream.close()
-        except Exception:
-            pass
-        try:
-            if self._dshow_proc:
-                try:
-                    self._dshow_running = False
-                except Exception:
-                    pass
-                try:
-                    self._dshow_proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    self._dshow_proc.kill()
-                except Exception:
-                    pass
-                try:
-                    self._dshow_proc = None
-                except Exception:
-                    pass
         except Exception:
             pass
         try:
@@ -2751,6 +2709,12 @@ class AudioRecorder:
         except Exception:
             s = None
         return m, s
+
+    def get_device_info(self):
+        """获取音频设备信息和错误"""
+        if not hasattr(self, '_device_info'):
+            return {"mic": None, "system": None, "errors": []}
+        return self._device_info
 
 
 def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
