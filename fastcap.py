@@ -88,7 +88,7 @@ try:
 except Exception:
     pass
 
-from PySide6.QtCore import Qt, QRect, QPoint, QRectF, QPointF, Signal, QThread, QTimer, QAbstractNativeEventFilter, QUrl
+from PySide6.QtCore import Qt, QRect, QPoint, QRectF, QPointF, Signal, QThread, QTimer, QAbstractNativeEventFilter, QUrl, QObject
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -326,7 +326,16 @@ def capture_region(rect: QRect) -> QPixmap:
         screen = QGuiApplication.screenAt(pt)
         if screen is None:
             screen = QGuiApplication.primaryScreen()
-        pix = screen.grabWindow(0, rect.left(), rect.top(), rect.width(), rect.height())
+        geo = screen.geometry()
+        x = rect.left() - geo.left()
+        y = rect.top() - geo.top()
+        w = rect.width()
+        h = rect.height()
+        if x < 0:
+            x = 0
+        if y < 0:
+            y = 0
+        pix = screen.grabWindow(0, x, y, w, h)
         if not pix.isNull():
             return pix
     except Exception:
@@ -2355,7 +2364,357 @@ class RecorderWindow(QMainWindow):
             if v2 <= 0:
                 pass
         except Exception:
+                pass
+
+
+class GifRecorderWindow(QMainWindow):
+    def __init__(self, rect: QRect):
+        super().__init__()
+        self.setWindowTitle("GIF 录制")
+        self.rect = rect
+        self.fps = 12
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._capture_frame)
+        self.frames = []
+        self.start_time = None
+        self._recframe = self._RecFrameOverlay()
+        tb = QToolBar("录制", self)
+        self.addToolBar(tb)
+        try:
+            self.addToolBarBreak(Qt.TopToolBarArea)
+        except Exception:
             pass
+        self._writer = None
+        self._tmp_gif_path = None
+        self._frame_count = 0
+        self._tasks = QListWidget(self)
+        try:
+            self._tasks.hide()
+        except Exception:
+            pass
+        self.setCentralWidget(self._tasks)
+        act_start = QAction("开始", self)
+        act_start.triggered.connect(self.start_record)
+        tb.addAction(act_start)
+        act_stop = QAction("停止并保存", self)
+        act_stop.triggered.connect(self.stop_record)
+        tb.addAction(act_stop)
+        from PySide6.QtWidgets import QLabel, QComboBox
+        tb.addSeparator()
+        tb.addWidget(QLabel("帧率:"))
+        self.fps_combo = QComboBox(self)
+        self.fps_combo.addItems(["8", "10", "12", "15", "20"])
+        self.fps_combo.setCurrentText("12")
+        self.fps_combo.currentTextChanged.connect(lambda t: self._set_fps(int(t)))
+        tb.addWidget(self.fps_combo)
+
+    def _set_fps(self, v: int):
+        try:
+            self.fps = int(max(1, min(30, v)))
+            if self.timer.isActive():
+                self.timer.setInterval(int(1000 / self.fps))
+        except Exception:
+            pass
+
+    def _bbox(self):
+        return {
+            "left": self.rect.left(),
+            "top": self.rect.top(),
+            "width": self.rect.width(),
+            "height": self.rect.height(),
+        }
+
+    def _update_title(self):
+        if self.start_time:
+            dur = time.time() - self.start_time
+            self.setWindowTitle(f"GIF 录制 - 录制中（{self._frame_count}帧，{dur:.1f}s）")
+            try:
+                self._recframe.update(self.rect, self.fps, self._frame_count)
+            except Exception:
+                pass
+        else:
+            self.setWindowTitle("GIF 录制")
+
+    def start_record(self):
+        if self.timer.isActive():
+            return
+        self.frames = []
+        self.start_time = time.time()
+        self._frame_count = 0
+        self.timer.start(int(1000 / self.fps))
+        self._update_title()
+        try:
+            import winsound
+            try:
+                winsound.Beep(1000, 120)
+            except Exception:
+                winsound.MessageBeep(-1)
+        except Exception:
+            pass
+        try:
+            self._recframe.start(self.rect, self.fps)
+        except Exception:
+            pass
+        try:
+            self.statusBar().showMessage("GIF录制已开始", 2000)
+            self._notify("GIF 录制", "录制已开始")
+        except Exception:
+            pass
+        try:
+            p = capture_region(self.rect)
+            self._frame_w = p.width()
+            self._frame_h = p.height()
+        except Exception:
+            self._frame_w = self.rect.width()
+            self._frame_h = self.rect.height()
+        try:
+            t = tempfile.NamedTemporaryFile(delete=False, suffix=".gif")
+            self._tmp_gif_path = t.name
+            t.close()
+            import imageio
+            self._writer = imageio.get_writer(self._tmp_gif_path, mode="I", duration=max(0.01, 1.0 / float(self.fps)), loop=0)
+        except Exception:
+            self._writer = None
+            self._tmp_gif_path = None
+
+    def _capture_frame(self):
+        try:
+            screen = QGuiApplication.screenAt(self.rect.center())
+            if screen is None:
+                screen = QGuiApplication.primaryScreen()
+            geo = screen.geometry()
+            x = self.rect.left() - geo.left()
+            y = self.rect.top() - geo.top()
+            w = self.rect.width()
+            h = self.rect.height()
+            if x < 0:
+                x = 0
+            if y < 0:
+                y = 0
+            pix = screen.grabWindow(0, x, y, w, h)
+            img = pix.toImage().convertToFormat(QImage.Format_RGB888)
+            w = img.width()
+            h = img.height()
+            stride = img.bytesPerLine()
+            ptr = img.bits()
+            try:
+                ptr.setsize(h * stride)
+            except Exception:
+                pass
+            arr = np.frombuffer(ptr, dtype=np.uint8)
+            arr = arr.reshape((h, stride))[:, : w * 3].reshape((h, w, 3)).copy()
+            if self._writer is not None:
+                try:
+                    self._writer.append_data(arr)
+                except Exception:
+                    self.frames.append(arr)
+            else:
+                self.frames.append(arr)
+            self._frame_count += 1
+        except Exception:
+            with mss.mss() as sct:
+                try:
+                    shot = sct.grab(self._bbox())
+                    frame = np.array(shot)[:, :, :3][:, :, ::-1]
+                    if self._writer is not None:
+                        try:
+                            self._writer.append_data(frame)
+                        except Exception:
+                            self.frames.append(frame)
+                    else:
+                        self.frames.append(frame)
+                    self._frame_count += 1
+                except Exception:
+                    pass
+        self._update_title()
+
+    def stop_record(self):
+        if self.timer.isActive():
+            self.timer.stop()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(self, "保存GIF", f"record_{ts}.gif", "GIF (*.gif)")
+        if not path:
+            return
+        save_ok = False
+        try:
+            if self._writer is not None:
+                try:
+                    self._writer.close()
+                except Exception:
+                    pass
+                if self._tmp_gif_path and os.path.exists(self._tmp_gif_path):
+                    try:
+                        if os.path.exists(path):
+                            os.unlink(path)
+                        os.replace(self._tmp_gif_path, path)
+                        save_ok = True
+                    except Exception:
+                        save_ok = False
+            else:
+                if self.frames:
+                    import imageio
+                    try:
+                        imageio.mimsave(path, self.frames, duration=max(0.01, 1.0 / float(self.fps)))
+                        save_ok = True
+                    except Exception:
+                        save_ok = False
+        except Exception:
+            save_ok = False
+        if save_ok:
+            try:
+                QMessageBox.information(self, "完成", "GIF 已保存")
+            except Exception:
+                pass
+        try:
+            import winsound
+            try:
+                winsound.Beep(800, 120)
+            except Exception:
+                winsound.MessageBeep(-1)
+        except Exception:
+            pass
+        try:
+            self._recframe.stop()
+        except Exception:
+            pass
+        try:
+            self._notify("GIF 录制", "录制已停止")
+        except Exception:
+            pass
+        self.frames = []
+        self.start_time = None
+        self._update_title()
+
+    def _notify(self, title: str, text: str):
+        try:
+            app = QApplication.instance()
+            if hasattr(app, "tray"):
+                app.tray.showMessage(title, text)
+        except Exception:
+            pass
+
+    class _RecFrameOverlay(QObject):
+        class _RecBar(QWidget):
+            def __init__(self):
+                super().__init__(None)
+                self._color = QColor(220, 0, 0, 200)
+                self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+                self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                self.setAttribute(Qt.WA_NoSystemBackground, True)
+                self.setAttribute(Qt.WA_TranslucentBackground, True)
+                self.hide()
+            def set_color(self, c: QColor):
+                self._color = c
+                try:
+                    self.update()
+                except Exception:
+                    pass
+            def paintEvent(self, ev):
+                p = QPainter(self)
+                p.fillRect(self.rect(), self._color)
+        class _RecInfo(QWidget):
+            def __init__(self):
+                super().__init__(None)
+                self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+                self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+                self.setAttribute(Qt.WA_TranslucentBackground, True)
+                self._lbl = QLabel(self)
+                self._lbl.setText("REC")
+                self._lbl.setStyleSheet("background-color: rgba(220,0,0,200); color: white; padding: 3px 6px; border-radius: 6px; font-weight: bold;")
+                try:
+                    f = QFont()
+                    f.setPointSize(9)
+                    self._lbl.setFont(f)
+                except Exception:
+                    pass
+                self.hide()
+            def set_text(self, s: str):
+                self._lbl.setText(s)
+                self._lbl.adjustSize()
+                self.resize(self._lbl.size())
+        def __init__(self):
+            super().__init__()
+            self._thick = 2
+            self._blink = False
+            self._bars: list[GifRecorderWindow._RecFrameOverlay._RecBar] = []
+            self._info = GifRecorderWindow._RecFrameOverlay._RecInfo()
+            self._timer = QTimer()
+            self._timer.timeout.connect(self._toggle)
+        def _ensure_bars(self):
+            if self._bars:
+                return
+            for _ in range(4):
+                b = GifRecorderWindow._RecFrameOverlay._RecBar()
+                self._bars.append(b)
+        def start(self, rect: QRect, fps: int):
+            self._ensure_bars()
+            self._place(rect)
+            for b in self._bars:
+                b.show()
+                try:
+                    b.raise_()
+                except Exception:
+                    pass
+            try:
+                self._info.set_text(f"REC {fps}fps")
+                self._place_info(rect)
+                self._info.show()
+                self._info.raise_()
+            except Exception:
+                pass
+            self._timer.start(500)
+        def update(self, rect: QRect, fps: int, frames: int):
+            if self._bars:
+                self._place(rect)
+            try:
+                self._info.set_text(f"REC {fps}fps {frames}帧")
+                self._place_info(rect)
+            except Exception:
+                pass
+        def stop(self):
+            try:
+                self._timer.stop()
+            except Exception:
+                pass
+            for b in self._bars:
+                b.hide()
+            try:
+                self._info.hide()
+            except Exception:
+                pass
+        def _place(self, rect: QRect):
+            b = int(self._thick)
+            l = rect.left()
+            t = rect.top()
+            w = rect.width()
+            h = rect.height()
+            self._bars[0].setGeometry(l, t - b, w, b)
+            self._bars[1].setGeometry(l, t + h, w, b)
+            self._bars[2].setGeometry(l - b, t - b, b, h + 2 * b)
+            self._bars[3].setGeometry(l + w, t - b, b, h + 2 * b)
+        def _place_info(self, rect: QRect):
+            iw = self._info.width()
+            ih = self._info.height()
+            x = rect.left() + 8
+            y = rect.top() - ih - 4
+            if y < 0:
+                x = rect.left() - iw - 4
+                y = rect.top() + 8
+            if x < 0:
+                x = rect.left() + 8
+                y = rect.top() + rect.height() + 4
+            self._info.move(x, y)
+        def _toggle(self):
+            self._blink = not self._blink
+            alpha = 200 if self._blink else 80
+            c = QColor(220, 0, 0, alpha)
+            for b in self._bars:
+                b.set_color(c)
+            try:
+                css = f"background-color: rgba(220,0,0,{alpha}); color: white; padding: 3px 6px; border-radius: 6px; font-weight: bold;"
+                self._info._lbl.setStyleSheet(css)
+            except Exception:
+                pass
 
 
 class AudioRecorder:
@@ -2960,59 +3319,64 @@ class FastCapApp(QApplication):
             sys.exit(1)
 
         self.tray = QSystemTrayIcon(create_app_icon(), self)
-        menu = QMenu()
+        self.tray_menu = QMenu()
 
         act_region = QAction("区域截图", self)
         act_region.triggered.connect(self.capture_region_flow)
         act_region.setShortcut("Ctrl+Alt+R")
-        menu.addAction(act_region)
+        self.tray_menu.addAction(act_region)
 
         act_full = QAction("全屏截图", self)
         act_full.triggered.connect(self.capture_full_flow)
         act_full.setShortcut("Ctrl+Alt+F")
-        menu.addAction(act_full)
+        self.tray_menu.addAction(act_full)
 
         # 滚动截图
         act_scroll = QAction("滚动截图", self)
         act_scroll.triggered.connect(self.capture_scroll_flow)
         act_scroll.setShortcut("Ctrl+Alt+S")
-        menu.addAction(act_scroll)
+        self.tray_menu.addAction(act_scroll)
         
         # 滚动截图模式选择子菜单
-        scroll_mode_menu = QMenu("滚动截图模式")
+        self.scroll_mode_menu = QMenu("滚动截图模式")
         
         self.act_mode_browser = QAction("浏览器模式", self)
         self.act_mode_browser.setCheckable(True)
         self.act_mode_browser.setChecked(True)  # 默认选中
         self.act_mode_browser.triggered.connect(self.set_scroll_mode_browser)
-        scroll_mode_menu.addAction(self.act_mode_browser)
+        self.scroll_mode_menu.addAction(self.act_mode_browser)
         
         self.act_mode_native = QAction("非浏览器模式", self)
         self.act_mode_native.setCheckable(True)
         self.act_mode_native.setChecked(False)
         self.act_mode_native.triggered.connect(self.set_scroll_mode_native)
-        scroll_mode_menu.addAction(self.act_mode_native)
+        self.scroll_mode_menu.addAction(self.act_mode_native)
         
-        menu.addMenu(scroll_mode_menu)
+        self.tray_menu.addMenu(self.scroll_mode_menu)
 
         act_record = QAction("屏幕录像（区域）", self)
         act_record.triggered.connect(self.record_region_flow)
         act_record.setShortcut("Ctrl+Alt+V")
-        menu.addAction(act_record)
+        self.tray_menu.addAction(act_record)
+
+        act_gif = QAction("GIF 动图录制（区域）", self)
+        act_gif.triggered.connect(self.record_gif_region_flow)
+        act_gif.setShortcut("Ctrl+Alt+G")
+        self.tray_menu.addAction(act_gif)
 
         act_pin = QAction("截图并复制（区域）", self)
         act_pin.triggered.connect(self.pin_region_flow)
         act_pin.setShortcut("Ctrl+Alt+P")
-        menu.addAction(act_pin)
+        self.tray_menu.addAction(act_pin)
 
-        menu.addSeparator()
+        self.tray_menu.addSeparator()
 
         act_exit = QAction("退出", self)
         act_exit.triggered.connect(self.quit)
         act_exit.setShortcut("Ctrl+Alt+Q")
-        menu.addAction(act_exit)
+        self.tray_menu.addAction(act_exit)
 
-        self.tray.setContextMenu(menu)
+        self.tray.setContextMenu(self.tray_menu)
         self.tray.setToolTip("FastCap 截图与标注")
         self.tray.show()
 
@@ -3121,6 +3485,20 @@ class FastCapApp(QApplication):
         self._windows.append(win)
         win.show()
 
+    def record_gif_region_flow(self):
+        pix = capture_all_monitors_overlay()
+        overlay = SelectionOverlay(pix)
+        overlay.captured_rect.connect(lambda rect: self._open_gif_recorder(rect))
+        self._overlays.append(overlay)
+        overlay.show()
+        overlay.raise_()
+        overlay.activateWindow()
+
+    def _open_gif_recorder(self, rect: QRect):
+        win = GifRecorderWindow(rect)
+        self._windows.append(win)
+        win.show()
+
     def pin_region_flow(self):
         pix = capture_all_monitors_overlay()
         overlay = SelectionOverlay(pix)
@@ -3161,6 +3539,7 @@ class FastCapApp(QApplication):
         HK_SCROLL = 3
         HK_RECORD = 4
         HK_PIN = 5
+        HK_GIF = 7
         # 退出热键可选，默认不注册以避免与其他应用冲突
         HK_EXIT = 6
 
@@ -3176,6 +3555,7 @@ class FastCapApp(QApplication):
             'V': 0x56,
             'P': 0x50,
             'Q': 0x51,
+            'G': 0x47,
         }
 
         # 事件过滤器
@@ -3233,12 +3613,13 @@ class FastCapApp(QApplication):
                 except Exception:
                     pass
 
-        # 注册 Ctrl+Alt+R/F/S/V/P
+        # 注册 Ctrl+Alt+R/F/S/V/P/G
         _reg(HK_REGION, MOD_CONTROL | MOD_ALT, VK['R'], self.capture_region_flow)
         _reg(HK_FULL,   MOD_CONTROL | MOD_ALT, VK['F'], self.capture_full_flow)
         _reg(HK_SCROLL, MOD_CONTROL | MOD_ALT, VK['S'], self.capture_scroll_flow)
         _reg(HK_RECORD, MOD_CONTROL | MOD_ALT, VK['V'], self.record_region_flow)
         _reg(HK_PIN,    MOD_CONTROL | MOD_ALT, VK['P'], self.pin_region_flow)
+        _reg(HK_GIF,    MOD_CONTROL | MOD_ALT, VK['G'], self.record_gif_region_flow)
         # 全局退出快捷键不默认注册，避免与其他程序冲突
 
     def _unregister_hotkeys(self):
