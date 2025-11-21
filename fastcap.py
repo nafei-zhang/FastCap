@@ -1,15 +1,51 @@
+from __future__ import annotations
+
 import sys
 import time
 import os
 import tempfile
 import subprocess
 from dataclasses import dataclass, field
-import numpy as np
-import pyautogui
-import wave
 import ctypes
 from ctypes import wintypes
 import threading
+
+# 延迟导入大型库以加速启动
+np = None
+pyautogui = None
+wave = None
+imageio = None
+
+def _ensure_numpy():
+    global np
+    if np is None:
+        import numpy
+        np = numpy
+    return np
+
+def _ensure_pyautogui():
+    global pyautogui
+    if pyautogui is None:
+        import pyautogui as pg
+        pyautogui = pg
+    return pyautogui
+
+def _ensure_wave():
+    global wave
+    if wave is None:
+        import wave as w
+        wave = w
+    return wave
+
+def _ensure_imageio():
+    global imageio
+    if imageio is None:
+        try:
+            import imageio as io
+            imageio = io
+        except ImportError:
+            pass
+    return imageio
 try:
     if sys.platform.startswith("win"):
         _h = ctypes.windll.kernel32.CreateMutexW(None, False, "FastCapSingleton")
@@ -129,11 +165,26 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 
-import mss
-try:
-    import cv2
-except Exception:
-    cv2 = None
+# 延迟导入
+mss = None
+cv2 = None
+
+def _ensure_mss():
+    global mss
+    if mss is None:
+        import mss as m
+        mss = m
+    return mss
+
+def _ensure_cv2():
+    global cv2
+    if cv2 is None:
+        try:
+            import cv2 as c
+            cv2 = c
+        except ImportError:
+            pass
+    return cv2
 
 
 # ----- Utilities -----
@@ -161,6 +212,7 @@ def create_app_icon() -> QIcon:
 def capture_all_monitors() -> QPixmap:
     # 优先使用 MSS 抓取整个虚拟桌面（物理像素级），确保清晰度不受 DPI 缩放影响
     try:
+        _ensure_mss()
         with mss.mss() as sct:
             mon = sct.monitors[0]
             shot = sct.grab(mon)
@@ -341,6 +393,7 @@ def capture_region(rect: QRect) -> QPixmap:
     except Exception:
         pass
     # 回退到 MSS 捕获（少数环境 Qt 抓屏失败时）
+    _ensure_mss()
     with mss.mss() as sct:
         bbox = {
             "left": rect.left(),
@@ -1379,6 +1432,8 @@ class ScrollWorker(QThread):
         self.stable_limit = 2
 
     def run(self):
+        _ensure_pyautogui()
+        _ensure_numpy()
         frames = []
         _cursor_hide()
         try:
@@ -1482,6 +1537,8 @@ class NativeScrollWorker(QThread):
         self.stable_limit = 3  # 需要更多次确认才停止
 
     def run(self):
+        _ensure_pyautogui()
+        _ensure_numpy()
         frames = []
         _cursor_hide()
         try:
@@ -1708,6 +1765,12 @@ class RecorderWindow(QMainWindow):
         from PySide6.QtWidgets import QPushButton
         help_btn = QPushButton("音频设置帮助", self)
         help_btn.clicked.connect(self._show_audio_help)
+        # 添加帮助图标
+        try:
+            help_icon = self.style().standardIcon(self.style().StandardPixmap.SP_MessageBoxQuestion)
+            help_btn.setIcon(help_icon)
+        except Exception:
+            pass
         tb2.addWidget(help_btn)
         
         tb2.addSeparator()
@@ -2180,45 +2243,75 @@ class RecorderWindow(QMainWindow):
         self.start_time = None
         self._update_title()
 
+    def closeEvent(self, event):
+        """窗口关闭时清理资源"""
+        try:
+            if self.timer.isActive():
+                self.timer.stop()
+        except Exception:
+            pass
+        try:
+            if self.audio_recorder:
+                self.audio_recorder.stop()
+                self.audio_recorder = None
+        except Exception:
+            pass
+        try:
+            if self._level_timer and self._level_timer.isActive():
+                self._level_timer.stop()
+        except Exception:
+            pass
+        try:
+            event.accept()
+        except Exception:
+            pass
+
     def _show_audio_help(self):
         """显示音频设置帮助信息"""
         help_text = """
-<h3>录制会议/系统声音设置指南</h3>
+<style>
+    body { font-family: 'Microsoft YaHei', sans-serif; }
+    h3 { color: #333333; }
+    b { color: #333333; }
+    li { margin: 8px 0; }
+    .highlight { background-color: #fff3cd; padding: 2px 4px; border-radius: 3px; }
+</style>
+<h3>🎵 录制会议/系统声音设置指南</h3>
 
-<p><b>问题：</b>录屏时只能录制麦克风声音，无法录制会议中其他人的声音。</p>
+<p><b>❓ 问题：</b>录屏时只能录制麦克风声音，无法录制会议中其他人的声音。</p>
 
-<p><b>原因：</b>Windows默认不允许录制扬声器播放的内容（即您听到的声音）。</p>
+<p><b>🔍 原因：</b>Windows默认不允许录制扬声器播放的内容。</p>
 
-<h4>解决方法1：启用立体声混音（推荐）</h4>
+<h4>✅ 解决方法1：启用立体声混音（推荐）</h4>
 <ol>
-<li>右键点击任务栏音量图标，选择<b>“声音设置”</b></li>
-<li>切换到<b>“录制”</b>选项卡</li>
-<li>右键空白处，勾选<b>“显示已禁用的设备”</b></li>
-<li>找到<b>“立体声混音”(Stereo Mix)</b>，右键选择<b>“启用”</b></li>
-<li>在FastCap中勾选<b>“优先虚拟声卡/立体声混音”</b>选项</li>
+<li>右键点击任务栏音量图标，选择 <span class="highlight">声音设置</span></li>
+<li>切换到 <span class="highlight">录制</span> 选项卡</li>
+<li>右键空白处，勾选 <span class="highlight">显示已禁用的设备</span></li>
+<li>找到 <span class="highlight">立体声混音 (Stereo Mix)</span>，右键选择 <span class="highlight">启用</span></li>
+<li>在FastCap中勾选 <span class="highlight">优先虚拟声卡/立体声混音</span> 选项</li>
 </ol>
 
-<h4>解决方法2：安装虚拟声卡（如果立体声混音不可用）</h4>
+<h4>📦 解决方法2：安装虚拟声卡（如果立体声混音不可用）</h4>
 <ol>
-<li>下载并安装<b>VB-Audio Virtual Cable</b>：<br>
-<a href="https://vb-audio.com/Cable/">https://vb-audio.com/Cable/</a></li>
+<li>下载并安装 <b>VB-Audio Virtual Cable</b><br>
+<span style="color: #333333;">https://vb-audio.com/Cable/</span></li>
 <li>安装后会在声音设备中显示虚拟设备</li>
 <li>在FastCap中选择对应的虚拟音频设备</li>
 </ol>
 
-<h4>使用提示</h4>
+<h4>💡 使用提示</h4>
 <ul>
-<li>音频源选择<b>“扬声器（所听内容）”</b>或<b>“麦克风 + 扬声器”</b></li>
-<li>观察<b>系统电平</b>进度条，确认有音频输入</li>
+<li>音频源选择 <span class="highlight">扬声器（所听内容）</span> 或 <span class="highlight">麦克风 + 扬声器</span></li>
+<li>观察 <span class="highlight">系统电平</span> 进度条，确认有音频输入</li>
 <li>开始录制时会显示使用的音频设备</li>
 </ul>
 
-<p><b>注意：</b>如果仍无法录制系统声音，请检查会议软件的音频输出设置，确保声音正常播放。</p>
+<p><b>⚠️ 注意：</b>如果仍无法录制系统声音，请检查会议软件的音频输出设置，确保声音正常播放。</p>
         """
         from PySide6.QtWidgets import QMessageBox, QTextBrowser
         msg = QMessageBox(self)
         msg.setWindowTitle("音频设置帮助")
-        msg.setIcon(QMessageBox.Information)
+        msg.setIcon(QMessageBox.NoIcon)
         text_browser = QTextBrowser()
         text_browser.setHtml(help_text)
         text_browser.setOpenExternalLinks(True)
@@ -2468,11 +2561,13 @@ class GifRecorderWindow(QMainWindow):
             self._frame_w = self.rect.width()
             self._frame_h = self.rect.height()
         try:
+            io = _ensure_imageio()
+            if io is None:
+                raise ImportError("imageio not available")
             t = tempfile.NamedTemporaryFile(delete=False, suffix=".gif")
             self._tmp_gif_path = t.name
             t.close()
-            import imageio
-            self._writer = imageio.get_writer(self._tmp_gif_path, mode="I", duration=max(0.01, 1.0 / float(self.fps)), loop=0)
+            self._writer = io.get_writer(self._tmp_gif_path, mode="I", duration=max(0.01, 1.0 / float(self.fps)), loop=0)
         except Exception:
             self._writer = None
             self._tmp_gif_path = None
@@ -2512,6 +2607,8 @@ class GifRecorderWindow(QMainWindow):
                 self.frames.append(arr)
             self._frame_count += 1
         except Exception:
+            _ensure_mss()
+            _ensure_numpy()
             with mss.mss() as sct:
                 try:
                     shot = sct.grab(self._bbox())
@@ -2551,10 +2648,10 @@ class GifRecorderWindow(QMainWindow):
                     except Exception:
                         save_ok = False
             else:
-                if self.frames:
-                    import imageio
+                io = _ensure_imageio()
+                if self.frames and io is not None:
                     try:
-                        imageio.mimsave(path, self.frames, duration=max(0.01, 1.0 / float(self.fps)))
+                        io.mimsave(path, self.frames, duration=max(0.01, 1.0 / float(self.fps)))
                         save_ok = True
                     except Exception:
                         save_ok = False
@@ -2583,7 +2680,36 @@ class GifRecorderWindow(QMainWindow):
             pass
         self.frames = []
         self.start_time = None
+        self._writer = None
         self._update_title()
+
+    def closeEvent(self, event):
+        """窗口关闭时清理资源"""
+        try:
+            if self.timer.isActive():
+                self.timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
+        except Exception:
+            pass
+        try:
+            if self._tmp_gif_path and os.path.exists(self._tmp_gif_path):
+                os.unlink(self._tmp_gif_path)
+        except Exception:
+            pass
+        try:
+            self._recframe.stop()
+            self._recframe.cleanup()
+        except Exception:
+            pass
+        try:
+            event.accept()
+        except Exception:
+            pass
 
     def _notify(self, title: str, text: str):
         try:
@@ -2680,6 +2806,25 @@ class GifRecorderWindow(QMainWindow):
                 b.hide()
             try:
                 self._info.hide()
+            except Exception:
+                pass
+        def cleanup(self):
+            """清理所有子部件"""
+            try:
+                self._timer.stop()
+                self._timer.deleteLater()
+            except Exception:
+                pass
+            for b in self._bars:
+                try:
+                    b.close()
+                    b.deleteLater()
+                except Exception:
+                    pass
+            self._bars.clear()
+            try:
+                self._info.close()
+                self._info.deleteLater()
             except Exception:
                 pass
         def _place(self, rect: QRect):
@@ -3076,8 +3221,10 @@ class AudioRecorder:
         return self._device_info
 
 
-def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
+def write_wav(path: str, data, samplerate: int, channels: int):
     # float32 [-1,1] -> int16 PCM
+    _ensure_numpy()
+    _ensure_wave()
     pcm = np.clip(data, -1.0, 1.0)
     pcm = (pcm * 32767.0).astype(np.int16)
     with wave.open(path, "wb") as wf:
@@ -3087,6 +3234,8 @@ def write_wav(path: str, data: np.ndarray, samplerate: int, channels: int):
         wf.writeframes(pcm.tobytes())
 
     def _capture_frame(self):
+        _ensure_mss()
+        _ensure_numpy()
         with mss.mss() as sct:
             try:
                 shot = sct.grab(self._bbox())
@@ -3659,7 +3808,8 @@ def main():
 # def qimage_to_pil(qimg: QImage) -> Image.Image: pass
 
 
-def qpixmap_to_np_rgb(pix: QPixmap) -> np.ndarray:
+def qpixmap_to_np_rgb(pix: QPixmap):
+    _ensure_numpy()
     img = pix.toImage().convertToFormat(QImage.Format_RGBA8888)
     w, h = img.width(), img.height()
     buf = img.bits()
@@ -3705,7 +3855,9 @@ def find_vertical_overlap(img1: np.ndarray, img2: np.ndarray, max_overlap: int =
             best_off = off
     return best_off
 
-def _find_vertical_overlap_cv(img1: np.ndarray, img2: np.ndarray) -> int:
+def _find_vertical_overlap_cv(img1, img2) -> int:
+    _ensure_cv2()
+    _ensure_numpy()
     if cv2 is None:
         return 0
     try:
@@ -3773,7 +3925,9 @@ def _find_vertical_overlap_cv(img1: np.ndarray, img2: np.ndarray) -> int:
     except Exception:
         return 0
 
-def _jam_overlap(img1: np.ndarray, img2: np.ndarray):
+def _jam_overlap(img1, img2):
+    _ensure_cv2()
+    _ensure_numpy()
     if cv2 is None:
         return 0, 0, 0, 0
     try:
