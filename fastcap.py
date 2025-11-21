@@ -1974,11 +1974,42 @@ class RecorderWindow(QMainWindow):
                     if device_info.get("errors"):
                         errors = "\n".join(device_info["errors"])
                         if self.audio_mode in ("system", "both"):
-                            QMessageBox.warning(self, "音频设备警告", 
-                                f"系统音频录制可能失败:\n{errors}\n\n解决方法:\n" +
-                                "1. 在Windows声音设置中启用'立体声混音'\n" +
-                                "2. 勾选'优先虚拟声卡/立体声混音'选项\n" +
-                                "3. 安装虚拟声卡(如VB-Audio Cable)")
+                            # 检查是否是USB耳机设备
+                            dev_name = ""
+                            try:
+                                if self._selected_sys_out is not None:
+                                    info = sd.query_devices(self._selected_sys_out)
+                                    dev_name = str(info.get('name', '')).lower()
+                            except Exception:
+                                pass
+                            
+                            is_usb_headset = any(k in dev_name for k in ['jabra', 'logitech', 'plantronics', 'usb', 'headset', '耳机'])
+                            
+                            if is_usb_headset:
+                                msg = QMessageBox(self)
+                                msg.setWindowTitle("音频设备警告")
+                                msg.setIcon(QMessageBox.Warning)
+                                msg.setText(f"系统音频录制可能失败:\n{errors}")
+                                msg.setInformativeText(
+                                    "<b>检测到您使用的是USB耳机（如Jabra）</b><br><br>" +
+                                    "<b>推荐解决方案：</b><br>" +
+                                    "1️⃣ <b>使用立体声混音</b>：<br>" +
+                                    "   • 在Windows声音设置中启用'立体声混音'<br>" +
+                                    "   • 勾选 <span style='background:#fff3cd;padding:2px'>'优先虚拟声卡/立体声混音'</span> 选项<br><br>" +
+                                    "2️⃣ <b>使用主要音频设备</b>：<br>" +
+                                    "   • 将 <span style='background:#fff3cd;padding:2px'>系统输出设备</span> 改为电脑主要音频设备<br>" +
+                                    "   • （如Realtek、NVIDIA高清音频等）<br><br>" +
+                                    "3️⃣ <b>安装虚拟声卡</b>：<br>" +
+                                    "   • 下载 VB-Audio Virtual Cable<br>" +
+                                    "   • 从 https://vb-audio.com/Cable/ 获取"
+                                )
+                                msg.exec()
+                            else:
+                                QMessageBox.warning(self, "音频设备警告", 
+                                    f"系统音频录制可能失败:\n{errors}\n\n解决方法:\n" +
+                                    "1. 在Windows声音设置中启用'立体声混音'\n" +
+                                    "2. 勾选'优先虚拟声卡/立体声混音'选项\n" +
+                                    "3. 安装虚拟声卡(如VB-Audio Cable)")
                 except Exception:
                     pass
                 try:
@@ -3061,34 +3092,50 @@ class AudioRecorder:
                     extra = getattr(sd, "WasapiSettings")(loopback=True)
                 except Exception:
                     extra = None
+                
+                # 智能检测设备通道数和采样率
                 ch = 2
+                sr = self.samplerate
                 try:
                     if dev_out is not None:
                         info = sd.query_devices(dev_out)
-                        ch = max(1, min(2, int(info.get("max_output_channels", 2))))
+                        max_ch = int(info.get("max_output_channels", 2))
+                        # 对于Jabra等耳机，先尝试设备支持的最大通道数
+                        ch = max(1, min(2, max_ch))
                         sr = int(float(info.get("default_samplerate", self.samplerate)))
-                    else:
-                        sr = self.samplerate
                 except Exception:
-                    ch = 2
-                    sr = self.samplerate
-                kwargs = {
-                    "samplerate": sr,
-                    "channels": ch,
-                    "dtype": "float32",
-                    "callback": self._sys_cb,
-                }
-                if dev_out is not None:
-                    kwargs["device"] = dev_out
-                if extra is not None:
-                    kwargs["extra_settings"] = extra
-                try:
-                    dev_info = sd.query_devices(dev_out) if dev_out is not None else sd.query_devices(kind='output')
-                    self._device_info["system"] = f"系统音频(WASAPI loopback): {dev_info.get('name', '默认设备')}"
-                except Exception:
-                    self._device_info["system"] = "系统音频(WASAPI loopback): 尝试默认设备"
-                self._sys_stream = sd.InputStream(**kwargs)
-                self._sys_stream.start()
+                    pass
+                
+                # 尝试多种通道配置
+                for try_ch in [ch, 2, 1]:
+                    try:
+                        kwargs = {
+                            "samplerate": sr,
+                            "channels": try_ch,
+                            "dtype": "float32",
+                            "callback": self._sys_cb,
+                        }
+                        if dev_out is not None:
+                            kwargs["device"] = dev_out
+                        if extra is not None:
+                            kwargs["extra_settings"] = extra
+                        
+                        try:
+                            dev_info = sd.query_devices(dev_out) if dev_out is not None else sd.query_devices(kind='output')
+                            self._device_info["system"] = f"系统音频(WASAPI loopback): {dev_info.get('name', '默认设备')} ({try_ch}ch)"
+                        except Exception:
+                            self._device_info["system"] = f"系统音频(WASAPI loopback): 默认设备 ({try_ch}ch)"
+                        
+                        self._sys_stream = sd.InputStream(**kwargs)
+                        self._sys_stream.start()
+                        # 成功，跳出重试循环
+                        break
+                    except Exception as e_ch:
+                        # 当前通道数失败，尝试下一个
+                        if try_ch == 1:
+                            # 最后一次尝试也失败，抛出异常
+                            raise e_ch
+                        continue
             except Exception as e:
                 try:
                     self._sys_stream = None
