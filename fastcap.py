@@ -15,6 +15,7 @@ np = None
 pyautogui = None
 wave = None
 imageio = None
+_pa = None
 
 def _ensure_numpy():
     global np
@@ -46,6 +47,16 @@ def _ensure_imageio():
         except ImportError:
             pass
     return imageio
+
+def _ensure_pyaudiowpatch():
+    global _pa
+    if _pa is None:
+        try:
+            import pyaudiowpatch as pawp
+            _pa = pawp
+        except ImportError:
+            pass
+    return _pa
 try:
     if sys.platform.startswith("win"):
         _h = ctypes.windll.kernel32.CreateMutexW(None, False, "FastCapSingleton")
@@ -2025,7 +2036,34 @@ class RecorderWindow(QMainWindow):
                 except Exception:
                     pass
             except Exception as e:
-                QMessageBox.warning(self, "音频录制失败", f"无法启动音频录制: {e}\n\n如需录制系统声音，请确保:\n1. 已在Windows声音设置中启用'立体声混音'\n2. 或安装虚拟声卡(如VB-Audio Cable)")
+                dev_name = ""
+                try:
+                    if self._selected_sys_out is not None:
+                        info = sd.query_devices(self._selected_sys_out)
+                        dev_name = str(info.get('name', '')).lower()
+                except Exception:
+                    pass
+
+                is_usb_headset = any(k in dev_name for k in ['jabra', 'logitech', 'plantronics', 'usb', 'headset', '耳机'])
+                if is_usb_headset:
+                    QMessageBox.warning(self, "音频录制失败", 
+                        f"无法启动音频录制: {e}\n\n" + 
+                        "检测到您正在使用USB耳机，请尝试以下方法：\n\n" +
+                        "1. 在Windows声音设置中启用'立体声混音'\n" +
+                        "2. 如果没有'立体声混音'，请尝试以下操作：\n" +
+                        "   • 右键任务栏音量图标 → 声音设置\n" +
+                        "   • 切换到'录制'选项卡\n" +
+                        "   • 右键空白处 → 显示禁用的设备\n" +
+                        "   • 找到并启用'WASAPI捕获'或'立体声混音'\n\n" +
+                        "3. 如果上述方法都不可用，请安装虚拟声卡：\n" +
+                        "   下载 VB-Audio Virtual Cable\n" +
+                        "   地址：https://vb-audio.com/Cable/")
+                else:
+                    QMessageBox.warning(self, "音频录制失败", 
+                        f"无法启动音频录制: {e}\n\n请尝试以下方法：\n" +
+                        "1. 在Windows声音设置中启用'WASAPI捕获'或'立体声混音'\n" +
+                        "2. 尝试切换到其他音频输出设备\n" +
+                        "3. 或安装虚拟声卡(VB-Audio Cable)")
                 self.audio_enabled = False
 
     def _capture_frame(self):
@@ -3143,26 +3181,207 @@ class AudioRecorder:
                     self._sys_stream = None
                 self._device_info["errors"].append(f"WASAPI loopback失败: {e}")
                 try:
-                    self._start_system_stereo_mix()
+                    self._start_system_with_wasapi()
                 except Exception as e2:
-                    self._device_info["errors"].append(f"立体声混音回退失败: {e2}")
+                    self._device_info["errors"].append(f"WASAPI loopback备用方案失败: {e2}")
+                    try:
+                        self._start_system_stereo_mix()
+                    except Exception as e3:
+                        self._device_info["errors"].append(f"立体声混音回退失败: {e3}")
+
+    def _start_system_with_wasapi(self):
+        # 优先使用 WASAPI
+        _ensure_pyaudiowpatch()
+        if _pa is None:
+            self._device_info["errors"].append("未找到 WASAPI 支持库")
+            # 如果没有 WASAPI 支持，回退到立体声混音
+            try:
+                self._start_system_stereo_mix()
+                return
+            except Exception as e:
+                self._device_info["errors"].append(f"立体声混音失败: {e}")
+                raise
+
+        try:
+            # 创建 WASAPI Host API实例
+            pa = _pa.PyAudio()
+            wasapi_info = pa.get_host_api_info_by_type(_pa.paWASAPI)
+            
+            # 获取当前选中的输出设备
+            target_device = None
+            if self.system_device_index is not None:
+                try:
+                    target_device = pa.get_device_info_by_index(self.system_device_index)
+                except Exception:
+                    pass
+                    
+            # 如果没有选中设备或获取失败，使用默认设备
+            if target_device is None:
+                try:
+                    target_device = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+                except Exception as e:
+                    raise RuntimeError(f"无法获取默认输出设备: {e}")
+                
+                # 查找对应的loopback设备
+                loopback_device = None
+                
+                # 优先查找loopback设备
+                for device in pa.get_loopback_device_info_generator():
+                    if device["hostApi"] == wasapi_info["index"]:
+                        loopback_device = device
+                        break
+                
+                # 如果没找到loopback设备，使用原始设备
+                if loopback_device is None:
+                    if target_device is None:
+                        raise RuntimeError("未找到可用的WASAPI输出设备")
+                    loopback_device = target_device
+                    
+                self._device_info["system"] = f"WASAPI Loopback: {loopback_device['name']}"
+                
+                # 创建音频流，使用设备原生参数
+                self._pa_instance = pa
+                self._sys_stream = pa.open(
+                    format=_pa.paFloat32,
+                    channels=2,  # 强制使用立体声
+                    rate=int(loopback_device.get("defaultSampleRate", 48000)),
+                    frames_per_buffer=2048,
+                    input=True,
+                    input_device_index=loopback_device["index"],
+                    stream_callback=self._pa_callback
+                )
+                
+                # 启动流
+                self._sys_stream.start_stream()
+                return
+                
+        except Exception as e:
+            # 清理资源
+            if hasattr(self, "_sys_stream") and self._sys_stream:
+                try:
+                    self._sys_stream.close()
+                except Exception:
+                    pass
+            if hasattr(self, "_pa_instance") and self._pa_instance:
+                try:
+                    self._pa_instance.terminate()
+                except Exception:
+                    pass
+                    
+            self._device_info["errors"].append(f"WASAPI捕获失败: {e}")
+            
+            # 尝试回退到立体声混音
+            try:
+                self._start_system_stereo_mix()
+                return
+            except Exception as e2:
+                self._device_info["errors"].append(f"立体声混音回退失败: {e2}")
+                raise RuntimeError(f"所有音频捕获方式都失败了，请检查系统音频设置")
+            # 清理失败的流
+            try:
+                if hasattr(self, "_sys_stream") and self._sys_stream:
+                    self._sys_stream.close()
+                if hasattr(self, "_pa_instance") and self._pa_instance:
+                    self._pa_instance.terminate()
+            except Exception:
+                pass
+            
+            # 所有通道配置都失败
+            raise Exception(f"所有通道配置都失败: {last_error}")
+        
+        # 如果pyaudiowpatch失败，回退到sounddevice
+        try:
+            # 获取设备信息
+            device_info = None
+            try:
+                if self.system_device_index is not None:
+                    device_info = sd.query_devices(self.system_device_index)
+            except Exception:
+                pass
+
+            # 确定采样率和通道数
+            samplerate = int(device_info["default_samplerate"]) if device_info else self.samplerate
+            max_channels = int(device_info["max_input_channels"]) if device_info else 2
+            
+            # 尝试不同的通道配置
+            last_error = None
+            for channels in [2, 1, max_channels]:
+                try:
+                    kwargs = {
+                        "samplerate": samplerate,
+                        "channels": channels,
+                        "dtype": "float32",
+                        "callback": self._sys_cb,
+                        "device": self.system_device_index,
+                        "latency": "high",
+                    }
+                    self._sys_stream = sd.InputStream(**kwargs)
+                    self._sys_stream.start()
+                    return  # 成功则返回
+                except Exception as e:
+                    last_error = e
+                    # 清理失败的流
+                    try:
+                        if self._sys_stream:
+                            self._sys_stream.stop()
+                            self._sys_stream.close()
+                    except Exception:
+                        pass
+
+            # 所有通道配置都失败，尝试立体声混音
+            self._device_info["errors"].append(f"WASAPI loopback备用方案失败: {last_error}")
+            self._start_system_stereo_mix()
+        except Exception as e2:
+            self._device_info["errors"].append(f"立体声混音回退失败: {e2}")
+                
+    def _pa_callback(self, in_data, frame_count, time_info, status):
+        try:
+            data = np.frombuffer(in_data, dtype=np.float32)
+            if data.ndim == 1:
+                data = data.reshape(-1, 1)
+            elif data.shape[1] > 1:
+                data = data.mean(axis=1, keepdims=True)
+            self._buf_sys.append(data.astype(np.float32))
+        except Exception:
+            pass
+        return (None, _pa.paContinue)
 
     def _start_system_stereo_mix(self):
+        """查找并使用立体声混音或WASAPI捕获接口"""
+        if sd is None:
+            raise RuntimeError("未找到sounddevice模块，请安装或尝试其他音频捕获方式")
+            
         dev_in = None
         devices = []
         try:
             devices = sd.query_devices()
         except Exception:
             devices = []
+        
+        # 第一优先级：查找立体声混音
         for i, info in enumerate(devices):
             try:
                 if info.get("max_input_channels", 0) > 0:
                     nm = str(info.get("name", "")).lower()
                     if any(k in nm for k in ["stereo mix", "立体声混音", "cable output", "vb-audio", "voicemeeter"]):
                         dev_in = i
+                        self._device_info["system"] = f"立体声混音: {info.get('name', '未知')}"
                         break
             except Exception:
-                pass
+                continue
+                
+        # 第二优先级：查找WASAPI捕获接口
+        if dev_in is None:
+            for i, info in enumerate(devices):
+                try:
+                    if info.get("max_input_channels", 0) > 0:
+                        nm = str(info.get("name", "")).lower()
+                        # WASAPI捕获接口通常包含这些关键词
+                        if any(k in nm for k in ["wasapi", "系统音频捕获", "what u hear", "听到的内容"]):
+                            dev_in = i
+                            break
+                except Exception:
+                    pass
         if dev_in is None:
             raise RuntimeError("未找到立体声混音设备。请在Windows声音设置中启用'立体声混音'或安装虚拟声卡(如VB-Audio Cable)")
         try:
@@ -3170,40 +3389,88 @@ class AudioRecorder:
             self._device_info["system"] = f"系统音频(立体声混音): {dev_info.get('name', '未知')}"
         except Exception:
             self._device_info["system"] = "系统音频(立体声混音)"
-        kwargs = {
-            "samplerate": self.samplerate,
-            "channels": 2,
-            "dtype": "float32",
-            "callback": self._sys_cb,
-            "device": dev_in,
-        }
-        self._sys_stream = sd.InputStream(**kwargs)
-        self._sys_stream.start()
+        # 获取设备支持的通道数和采样率
+        try:
+            dev_info = sd.query_devices(dev_in)
+            max_channels = int(dev_info.get("max_input_channels", 2))
+            sr = int(float(dev_info.get("default_samplerate", self.samplerate)))
+            self._device_info["system"] = f"系统音频: {dev_info.get('name', '未知')}"
+        except Exception:
+            max_channels = 2
+            sr = self.samplerate
+            self._device_info["system"] = "系统音频: 未知设备"
+            
+        # 配置音频流 - 从低到高尝试不同的通道配置
+        last_error = None
+        for channels in [2, 1, max_channels]:  # 优先尝试最常见的配置
+            try:
+                kwargs = {
+                    "samplerate": sr,
+                    "channels": channels,
+                    "dtype": "float32",
+                    "callback": self._sys_cb,
+                    "device": dev_in,
+                    "latency": "high",  # 增加稳定性
+                    "blocksize": 1024
+                }
+                
+                # 清理之前的流
+                try:
+                    if self._sys_stream:
+                        self._sys_stream.stop()
+                        self._sys_stream.close()
+                except Exception:
+                    pass
+                    
+                self._sys_stream = sd.InputStream(**kwargs)
+                self._sys_stream.start()
+                return  # 成功启动即返回
+            except Exception as e:
+                last_error = e
+                continue
+        
+        # 所有通道配置都失败
+        raise RuntimeError(f"无法启动音频录制: {last_error}")
 
     def stop(self):
         self._running = False
+        # 清理麦克风流
         try:
             if self._mic_stream:
                 self._mic_stream.stop()
                 self._mic_stream.close()
         except Exception:
             pass
+        
+        # 清理系统音频流
         try:
             if self._sys_stream:
-                self._sys_stream.stop()
-                self._sys_stream.close()
+                if hasattr(self._sys_stream, "stop_stream"):
+                    # pyaudiowpatch流
+                    self._sys_stream.stop_stream()
+                    self._sys_stream.close()
+                else:
+                    # sounddevice流
+                    self._sys_stream.stop()
+                    self._sys_stream.close()
         except Exception:
             pass
+            
+        # 清理pyaudiowpatch实例
         try:
-            if self._sc_running:
-                self._sc_running = False
-                try:
-                    if self._sc_rec:
-                        self._sc_rec.close()
-                except Exception:
-                    pass
+            if hasattr(self, "_pa_instance"):
+                self._pa_instance.terminate()
         except Exception:
             pass
+            
+        # 清理soundcard流
+        try:
+            if self._sc_rec:
+                self._sc_running = False
+                self._sc_rec.close()
+        except Exception:
+            pass
+            
         self._mic_stream = None
         self._sys_stream = None
         import numpy as np
