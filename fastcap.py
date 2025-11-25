@@ -15,7 +15,11 @@ np = None
 pyautogui = None
 wave = None
 imageio = None
+sd = None
+sc = None
 _pa = None
+_cached_ffmpeg_exe = None
+_ffmpeg_env_prepared = False
 
 def _ensure_numpy():
     global np
@@ -57,6 +61,105 @@ def _ensure_pyaudiowpatch():
         except ImportError:
             pass
     return _pa
+
+
+def _ensure_sounddevice():
+    global sd
+    if sd is None:
+        try:
+            import sounddevice as _sd
+            sd = _sd
+        except Exception:
+            sd = None
+    return sd
+
+
+def _ensure_soundcard():
+    global sc
+    if sc is None:
+        try:
+            import soundcard as _sc
+            sc = _sc
+        except Exception:
+            sc = None
+    return sc
+
+
+def _prepare_ffmpeg_env():
+    """Resolve ffmpeg once and copy it to a fast local path lazily."""
+    global _cached_ffmpeg_exe, _ffmpeg_env_prepared
+    if _cached_ffmpeg_exe and os.path.exists(_cached_ffmpeg_exe):
+        return _cached_ffmpeg_exe
+    if _ffmpeg_env_prepared:
+        return _cached_ffmpeg_exe
+
+    _ffmpeg_env_prepared = True
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+    except Exception:
+        return None
+
+    ffmpeg_exe = None
+    base_dir = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
+    try:
+        candidates = [os.path.join(base_dir, "imageio_ffmpeg"), base_dir]
+        for _dir in candidates:
+            if not os.path.isdir(_dir):
+                continue
+            for name in os.listdir(_dir):
+                lower = name.lower()
+                if lower.startswith("ffmpeg") and lower.endswith(".exe"):
+                    path = os.path.join(_dir, name)
+                    if os.path.exists(path):
+                        ffmpeg_exe = path
+                        break
+            if ffmpeg_exe:
+                break
+    except Exception:
+        ffmpeg_exe = None
+
+    if ffmpeg_exe is None:
+        try:
+            ffmpeg_exe = get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_exe = None
+
+    try:
+        import shutil
+    except Exception:
+        shutil = None
+
+    if ffmpeg_exe and shutil is not None:
+        exe_dir = os.path.dirname(getattr(sys, "executable", __file__))
+        targets = [exe_dir]
+        try:
+            targets.append(os.path.join(os.environ.get("LOCALAPPDATA", exe_dir), "FastCap"))
+        except Exception:
+            pass
+        for target in targets:
+            try:
+                os.makedirs(target, exist_ok=True)
+                dst = os.path.join(target, "fastcap-ffmpeg.exe")
+                if not os.path.exists(dst):
+                    shutil.copyfile(ffmpeg_exe, dst)
+                if os.path.exists(dst):
+                    ffmpeg_exe = dst
+                    break
+            except Exception:
+                continue
+
+    if ffmpeg_exe:
+        os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_exe
+        _cached_ffmpeg_exe = ffmpeg_exe
+    return _cached_ffmpeg_exe
+
+
+def _get_ffmpeg_path():
+    """Public helper for code paths that need ffmpeg."""
+    cached = os.environ.get("IMAGEIO_FFMPEG_EXE")
+    if cached and os.path.exists(cached):
+        return cached
+    return _prepare_ffmpeg_env()
 try:
     if sys.platform.startswith("win"):
         _h = ctypes.windll.kernel32.CreateMutexW(None, False, "FastCapSingleton")
@@ -66,72 +169,6 @@ try:
             except Exception:
                 pass
             sys.exit(0)
-except Exception:
-    pass
-try:
-    import sounddevice as sd
-except Exception:
-    sd = None
-
-try:
-    import soundcard as sc
-except Exception:
-    sc = None
-
-try:
-    from imageio_ffmpeg import get_ffmpeg_exe
-    _ffmpeg_exe = None
-    _base = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
-    try:
-        _dirs = [os.path.join(_base, "imageio_ffmpeg"), _base]
-        for _d in _dirs:
-            if os.path.isdir(_d):
-                for _name in os.listdir(_d):
-                    _n = _name.lower()
-                    if _n.startswith("ffmpeg") and _n.endswith(".exe"):
-                        _p = os.path.join(_d, _name)
-                        if os.path.exists(_p):
-                            _ffmpeg_exe = _p
-                            break
-            if _ffmpeg_exe:
-                break
-    except Exception:
-        _ffmpeg_exe = None
-    if _ffmpeg_exe is None:
-        try:
-            _ffmpeg_exe = get_ffmpeg_exe()
-        except Exception:
-            _ffmpeg_exe = None
-    import shutil
-    _set = False
-    if _ffmpeg_exe and os.path.exists(_ffmpeg_exe):
-        try:
-            _exe_dir = os.path.dirname(getattr(sys, "executable", __file__))
-        except Exception:
-            _exe_dir = os.path.dirname(__file__)
-        _targets = []
-        try:
-            _targets.append(_exe_dir)
-        except Exception:
-            pass
-        try:
-            _targets.append(os.path.join(os.environ.get("LOCALAPPDATA", _exe_dir), "FastCap"))
-        except Exception:
-            pass
-        for _t in _targets:
-            try:
-                os.makedirs(_t, exist_ok=True)
-                _dst = os.path.join(_t, "fastcap-ffmpeg.exe")
-                if not os.path.exists(_dst):
-                    shutil.copyfile(_ffmpeg_exe, _dst)
-                if os.path.exists(_dst):
-                    os.environ["IMAGEIO_FFMPEG_EXE"] = _dst
-                    _set = True
-                    break
-            except Exception:
-                continue
-        if not _set:
-            os.environ["IMAGEIO_FFMPEG_EXE"] = _ffmpeg_exe
 except Exception:
     pass
 
@@ -1968,6 +2005,7 @@ class RecorderWindow(QMainWindow):
             self._writer = None
             self._tmp_video_path = None
         if self.audio_enabled:
+            _ensure_sounddevice()
             try:
                 self.audio_recorder = AudioRecorder(source=self.audio_mode, system_device_index=self._selected_sys_out, prefer_stereo_mix=bool(self.cb_prefer_mix.isChecked()), include_comm=bool(self.cb_include_comm.isChecked()), backend="auto")
                 self.audio_recorder.start()
@@ -2184,11 +2222,7 @@ class RecorderWindow(QMainWindow):
             except Exception as e:
                 audio_data = None
                 QMessageBox.warning(self, "音频提示", f"停止音频录制失败，将保存纯视频：{e}")
-            try:
-                from imageio_ffmpeg import get_ffmpeg_exe
-                ffmpeg = get_ffmpeg_exe()
-            except Exception:
-                ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
+            ffmpeg = _get_ffmpeg_path()
             try:
                 started = False
                 if self.audio_mode == "both" and hasattr(self.audio_recorder, "tracks"):
@@ -2424,6 +2458,7 @@ class RecorderWindow(QMainWindow):
         self.sys_out_combo.addItem("默认输出设备")
         self._sys_out_indices.append(None)
         try:
+            _ensure_sounddevice()
             if sd is not None:
                 wasapi_index = None
                 try:
@@ -2964,6 +2999,8 @@ class AudioRecorder:
                 pass
 
     def start(self):
+        _ensure_sounddevice()
+        _ensure_soundcard()
         self._buf_mic.clear()
         self._buf_sys.clear()
         self._device_info = {"mic": None, "system": None, "errors": []}
@@ -2993,6 +3030,17 @@ class AudioRecorder:
                 self._mic_stream = None
                 self._device_info["errors"].append(f"麦克风启动失败: {e}")
         if self.source in ("system", "both"):
+            # 1) 首选 Windows 平台下的原生 WASAPI loopback
+            if sys.platform.startswith("win") and self.backend in ("auto", "wasapi", "pyaudio", "pawp"):
+                try:
+                    self._start_system_with_wasapi()
+                    if self._sys_stream:
+                        return
+                except Exception as e:
+                    self._device_info["errors"].append(f"WASAPI loopback失败: {e}")
+                    # 失败后继续尝试其他方案
+
+            # 2) 其次尝试 soundcard 的 loopback
             if (self.backend == "soundcard" or (self.backend == "auto" and sc is not None)):
                 try:
                     spk = None
@@ -3068,6 +3116,8 @@ class AudioRecorder:
                         return
                 except Exception as e:
                     self._device_info["errors"].append(f"soundcard loopback失败: {e}")
+
+            # 3) 最后使用 sounddevice 的 WASAPI loopback，再不行回退到立体声混音
             try:
                 dev_out = self.system_device_index
                 try:
@@ -3081,8 +3131,8 @@ class AudioRecorder:
                     try:
                         self._start_system_stereo_mix()
                         return
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._device_info["errors"].append(f"立体声混音优先失败: {e}")
                 if dev_out is None:
                     try:
                         hostapis = sd.query_hostapis()
@@ -3145,6 +3195,7 @@ class AudioRecorder:
                     pass
                 
                 # 尝试多种通道配置
+                started = False
                 for try_ch in [ch, 2, 1]:
                     try:
                         kwargs = {
@@ -3166,173 +3217,126 @@ class AudioRecorder:
                         
                         self._sys_stream = sd.InputStream(**kwargs)
                         self._sys_stream.start()
-                        # 成功，跳出重试循环
+                        started = True
                         break
                     except Exception as e_ch:
-                        # 当前通道数失败，尝试下一个
                         if try_ch == 1:
-                            # 最后一次尝试也失败，抛出异常
                             raise e_ch
                         continue
+                if started:
+                    return
             except Exception as e:
+                self._sys_stream = None
+                self._device_info["errors"].append(f"WASAPI(loopback via sounddevice)失败: {e}")
                 try:
-                    self._sys_stream = None
-                except Exception:
-                    self._sys_stream = None
-                self._device_info["errors"].append(f"WASAPI loopback失败: {e}")
-                try:
-                    self._start_system_with_wasapi()
-                except Exception as e2:
-                    self._device_info["errors"].append(f"WASAPI loopback备用方案失败: {e2}")
-                    try:
-                        self._start_system_stereo_mix()
-                    except Exception as e3:
-                        self._device_info["errors"].append(f"立体声混音回退失败: {e3}")
+                    self._start_system_stereo_mix()
+                except Exception as e3:
+                    self._device_info["errors"].append(f"立体声混音回退失败: {e3}")
 
     def _start_system_with_wasapi(self):
-        # 优先使用 WASAPI
+        """使用 pyaudiowpatch 直接驱动 Windows WASAPI Loopback。"""
+        if not sys.platform.startswith("win"):
+            raise RuntimeError("WASAPI loopback 仅支持 Windows")
+
         _ensure_pyaudiowpatch()
+        _ensure_sounddevice()
         if _pa is None:
-            self._device_info["errors"].append("未找到 WASAPI 支持库")
-            # 如果没有 WASAPI 支持，回退到立体声混音
-            try:
-                self._start_system_stereo_mix()
-                return
-            except Exception as e:
-                self._device_info["errors"].append(f"立体声混音失败: {e}")
-                raise
+            raise RuntimeError("未找到 pyaudiowpatch，请安装后重试")
+
+        pa = _pa.PyAudio()
+        self._pa_instance = pa
 
         try:
-            # 创建 WASAPI Host API实例
-            pa = _pa.PyAudio()
             wasapi_info = pa.get_host_api_info_by_type(_pa.paWASAPI)
-            
-            # 获取当前选中的输出设备
-            target_device = None
-            if self.system_device_index is not None:
-                try:
-                    target_device = pa.get_device_info_by_index(self.system_device_index)
-                except Exception:
-                    pass
-                    
-            # 如果没有选中设备或获取失败，使用默认设备
-            if target_device is None:
-                try:
-                    target_device = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-                except Exception as e:
-                    raise RuntimeError(f"无法获取默认输出设备: {e}")
-                
-                # 查找对应的loopback设备
-                loopback_device = None
-                
-                # 优先查找loopback设备
-                for device in pa.get_loopback_device_info_generator():
-                    if device["hostApi"] == wasapi_info["index"]:
-                        loopback_device = device
-                        break
-                
-                # 如果没找到loopback设备，使用原始设备
-                if loopback_device is None:
-                    if target_device is None:
-                        raise RuntimeError("未找到可用的WASAPI输出设备")
-                    loopback_device = target_device
-                    
-                self._device_info["system"] = f"WASAPI Loopback: {loopback_device['name']}"
-                
-                # 创建音频流，使用设备原生参数
-                self._pa_instance = pa
-                self._sys_stream = pa.open(
-                    format=_pa.paFloat32,
-                    channels=2,  # 强制使用立体声
-                    rate=int(loopback_device.get("defaultSampleRate", 48000)),
-                    frames_per_buffer=2048,
-                    input=True,
-                    input_device_index=loopback_device["index"],
-                    stream_callback=self._pa_callback
-                )
-                
-                # 启动流
-                self._sys_stream.start_stream()
-                return
-                
-        except Exception as e:
-            # 清理资源
-            if hasattr(self, "_sys_stream") and self._sys_stream:
-                try:
-                    self._sys_stream.close()
-                except Exception:
-                    pass
-            if hasattr(self, "_pa_instance") and self._pa_instance:
-                try:
-                    self._pa_instance.terminate()
-                except Exception:
-                    pass
-                    
-            self._device_info["errors"].append(f"WASAPI捕获失败: {e}")
-            
-            # 尝试回退到立体声混音
+        except Exception as exc:
+            pa.terminate()
+            self._pa_instance = None
+            raise RuntimeError("当前系统不支持 WASAPI Host API") from exc
+
+        # 根据 sounddevice 的设备名称尽量匹配相同输出
+        target_name = None
+        if self.system_device_index is not None and sd is not None:
             try:
-                self._start_system_stereo_mix()
-                return
-            except Exception as e2:
-                self._device_info["errors"].append(f"立体声混音回退失败: {e2}")
-                raise RuntimeError(f"所有音频捕获方式都失败了，请检查系统音频设置")
-            # 清理失败的流
-            try:
-                if hasattr(self, "_sys_stream") and self._sys_stream:
-                    self._sys_stream.close()
-                if hasattr(self, "_pa_instance") and self._pa_instance:
-                    self._pa_instance.terminate()
+                info = sd.query_devices(self.system_device_index)
+                target_name = str(info.get("name", "")).lower()
             except Exception:
-                pass
-            
-            # 所有通道配置都失败
-            raise Exception(f"所有通道配置都失败: {last_error}")
-        
-        # 如果pyaudiowpatch失败，回退到sounddevice
+                target_name = None
+
+        loopbacks = []
         try:
-            # 获取设备信息
-            device_info = None
+            loopbacks = list(pa.get_loopback_device_info_generator())
+        except Exception:
+            loopbacks = []
+
+        if not loopbacks:
+            # 兼容旧版本 pyaudiowpatch：遍历所有设备取 isLoopbackDevice
             try:
-                if self.system_device_index is not None:
-                    device_info = sd.query_devices(self.system_device_index)
+                count = pa.get_device_count()
+            except Exception:
+                count = 0
+            for idx in range(count):
+                try:
+                    info = pa.get_device_info_by_index(idx)
+                    if info.get("hostApi") == wasapi_info.get("index") and info.get("isLoopbackDevice"):
+                        loopbacks.append(info)
+                except Exception:
+                    continue
+
+        if not loopbacks:
+            pa.terminate()
+            self._pa_instance = None
+            raise RuntimeError("WASAPI 未暴露任何 Loopback 设备")
+
+        blocked_keywords = ["hands-free", "ag audio", "hfp", "hsp", "通话", "通信", "speakerphone", "telephone", "telephony"]
+        prefer_keywords = ["stereo mix", "what u hear", "立体声混音", "听到的内容", "cable output", "vb-audio", "voicemeeter", "speakers", "音箱", "headphones", "耳机"]
+
+        def _score(dev: dict) -> int:
+            nm = str(dev.get("name", "")).lower()
+            score = 0
+            if target_name and target_name in nm:
+                score += 200
+            if any(k in nm for k in prefer_keywords):
+                score += 120
+            if self.include_comm and any(k in nm for k in ["communications", "speakerphone", "hands-free", "通话", "通信"]):
+                score += 40
+            if not self.include_comm and any(k in nm for k in blocked_keywords):
+                score -= 200
+            return score
+
+        loopbacks.sort(key=_score, reverse=True)
+        best = loopbacks[0]
+
+        rate = int(best.get("defaultSampleRate") or wasapi_info.get("defaultSampleRate") or self.samplerate)
+        channels = int(best.get("maxInputChannels", 2)) or 2
+        channels = max(1, min(2, channels))
+
+        self._device_info["system"] = f"WASAPI Loopback: {best.get('name', '未知')} ({channels}ch)"
+
+        try:
+            self._sys_stream = pa.open(
+                format=_pa.paFloat32,
+                channels=channels,
+                rate=rate,
+                frames_per_buffer=2048,
+                input=True,
+                input_device_index=best["index"],
+                stream_callback=self._pa_callback,
+            )
+            self._sys_stream.start_stream()
+        except Exception as exc:
+            # 打开失败需要终止并清理
+            try:
+                if self._sys_stream:
+                    self._sys_stream.close()
             except Exception:
                 pass
-
-            # 确定采样率和通道数
-            samplerate = int(device_info["default_samplerate"]) if device_info else self.samplerate
-            max_channels = int(device_info["max_input_channels"]) if device_info else 2
-            
-            # 尝试不同的通道配置
-            last_error = None
-            for channels in [2, 1, max_channels]:
-                try:
-                    kwargs = {
-                        "samplerate": samplerate,
-                        "channels": channels,
-                        "dtype": "float32",
-                        "callback": self._sys_cb,
-                        "device": self.system_device_index,
-                        "latency": "high",
-                    }
-                    self._sys_stream = sd.InputStream(**kwargs)
-                    self._sys_stream.start()
-                    return  # 成功则返回
-                except Exception as e:
-                    last_error = e
-                    # 清理失败的流
-                    try:
-                        if self._sys_stream:
-                            self._sys_stream.stop()
-                            self._sys_stream.close()
-                    except Exception:
-                        pass
-
-            # 所有通道配置都失败，尝试立体声混音
-            self._device_info["errors"].append(f"WASAPI loopback备用方案失败: {last_error}")
-            self._start_system_stereo_mix()
-        except Exception as e2:
-            self._device_info["errors"].append(f"立体声混音回退失败: {e2}")
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+            self._pa_instance = None
+            self._sys_stream = None
+            raise RuntimeError(f"WASAPI loopback打开失败: {exc}")
                 
     def _pa_callback(self, in_data, frame_count, time_info, status):
         try:
@@ -3348,6 +3352,7 @@ class AudioRecorder:
 
     def _start_system_stereo_mix(self):
         """查找并使用立体声混音或WASAPI捕获接口"""
+        _ensure_sounddevice()
         if sd is None:
             raise RuntimeError("未找到sounddevice模块，请安装或尝试其他音频捕获方式")
             
@@ -3629,11 +3634,7 @@ def write_wav(path: str, data, samplerate: int, channels: int):
             except Exception as e:
                 audio_data = None
                 QMessageBox.warning(self, "音频提示", f"停止音频录制失败，将保存纯视频：{e}")
-            try:
-                from imageio_ffmpeg import get_ffmpeg_exe
-                ffmpeg = get_ffmpeg_exe()
-            except Exception:
-                ffmpeg = os.environ.get("IMAGEIO_FFMPEG_EXE")
+            ffmpeg = _get_ffmpeg_path()
             try:
                 if self.audio_mode == "both" and hasattr(self.audio_recorder, "tracks"):
                     mic, sysa = self.audio_recorder.tracks()
