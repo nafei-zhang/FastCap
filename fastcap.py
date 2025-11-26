@@ -3203,58 +3203,100 @@ class AudioRecorder:
                 raise
 
         try:
-            # 创建 WASAPI Host API实例
+            # 创建 WASAPI Host API 实例
             pa = _pa.PyAudio()
             wasapi_info = pa.get_host_api_info_by_type(_pa.paWASAPI)
-            
-            # 获取当前选中的输出设备
+
+            # 先确定要监听的“播放设备”（可能是你在下拉框里选的 Jabra 等 USB 设备）
             target_device = None
-            if self.system_device_index is not None:
+            target_name = None
+
+            # 注意：界面里保存的 system_device_index 是 sounddevice 的索引，
+            # 和 pyaudio 的设备索引体系完全不同，这里需要通过“名称”再匹配一遍。
+            try:
+                if self.system_device_index is not None and sd is not None:
+                    sd_info = sd.query_devices(self.system_device_index)
+                    target_name = str(sd_info.get("name", "")).lower()
+            except Exception:
+                target_name = None
+
+            # 在 WASAPI 输出设备中按名称匹配（Jabra 等 USB 耳机会走这里）
+            if target_name:
                 try:
-                    target_device = pa.get_device_info_by_index(self.system_device_index)
+                    best = None
+                    for i in range(pa.get_device_count()):
+                        try:
+                            info = pa.get_device_info_by_index(i)
+                            if info.get("hostApi") != wasapi_info["index"]:
+                                continue
+                            if info.get("maxOutputChannels", 0) <= 0:
+                                continue
+                            name = str(info.get("name", "")).lower()
+                            score = 0
+                            if target_name in name or name in target_name:
+                                score = 100
+                            elif any(k in name for k in ["headset", "耳机", "jabra", "logitech", "plantronics", "usb"]):
+                                score = 80
+                            if best is None or score > best[0]:
+                                best = (score, info)
+                        except Exception:
+                            continue
+                    if best is not None and best[0] >= 80:
+                        target_device = best[1]
                 except Exception:
-                    pass
-                    
-            # 如果没有选中设备或获取失败，使用默认设备
+                    target_device = None
+
+            # 如果没匹配到，就退回到 WASAPI 默认输出设备
             if target_device is None:
                 try:
                     target_device = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
                 except Exception as e:
                     raise RuntimeError(f"无法获取默认输出设备: {e}")
-                
-                # 查找对应的loopback设备
-                loopback_device = None
-                
-                # 优先查找loopback设备
+
+            if target_device is None:
+                raise RuntimeError("未找到可用的WASAPI输出设备")
+
+            target_name = str(target_device.get("name", "")).lower()
+
+            # 在 loopback 设备列表中，查找与目标输出设备匹配的 loopback 设备
+            loopback_device = None
+            try:
                 for device in pa.get_loopback_device_info_generator():
-                    if device["hostApi"] == wasapi_info["index"]:
-                        loopback_device = device
-                        break
-                
-                # 如果没找到loopback设备，使用原始设备
-                if loopback_device is None:
-                    if target_device is None:
-                        raise RuntimeError("未找到可用的WASAPI输出设备")
-                    loopback_device = target_device
-                    
-                self._device_info["system"] = f"WASAPI Loopback: {loopback_device['name']}"
-                
-                # 创建音频流，使用设备原生参数
-                self._pa_instance = pa
-                self._sys_stream = pa.open(
-                    format=_pa.paFloat32,
-                    channels=2,  # 强制使用立体声
-                    rate=int(loopback_device.get("defaultSampleRate", 48000)),
-                    frames_per_buffer=2048,
-                    input=True,
-                    input_device_index=loopback_device["index"],
-                    stream_callback=self._pa_callback
-                )
-                
-                # 启动流
-                self._sys_stream.start_stream()
-                return
-                
+                    try:
+                        if device.get("hostApi") != wasapi_info["index"]:
+                            continue
+                        name = str(device.get("name", "")).lower()
+                        # 对于 USB 耳机（Jabra 等），loopback 名称通常会包含原始输出设备名称
+                        if target_name and (target_name in name or name in target_name):
+                            loopback_device = device
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                loopback_device = None
+
+            # 如果没单独的 loopback 设备，就直接用原始输出设备做输入（部分系统上就是这么实现的）
+            if loopback_device is None:
+                loopback_device = target_device
+
+            self._device_info["system"] = f"WASAPI Loopback: {loopback_device.get('name', '未知设备')}"
+
+            # 创建音频流，使用设备原生参数
+            self._pa_instance = pa
+            self._sys_stream = pa.open(
+                format=_pa.paFloat32,
+                channels=2,  # 强制使用立体声
+                rate=int(loopback_device.get("defaultSampleRate", 48000)),
+                frames_per_buffer=2048,
+                input=True,
+                input_device_index=loopback_device["index"],
+                stream_callback=self._pa_callback,
+            )
+
+            # 启动流
+            self._sys_stream.start_stream()
+            return
+
         except Exception as e:
             # 清理资源
             if hasattr(self, "_sys_stream") and self._sys_stream:
