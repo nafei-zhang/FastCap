@@ -419,6 +419,198 @@ def capture_region(rect: QRect) -> QPixmap:
         return pix
 
 
+def get_cursor_info():
+    """获取鼠标光标的位置和图像。返回 (x, y, cursor_pixmap, hotspot_x, hotspot_y) 或 None"""
+    try:
+        if not sys.platform.startswith("win"):
+            return None
+        
+        # 获取鼠标位置
+        POINT = wintypes.POINT
+        pt = POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        cursor_x, cursor_y = pt.x, pt.y
+        
+        # 获取光标句柄
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_int),
+                ("flags", ctypes.c_int),
+                ("hCursor", ctypes.c_void_p),
+                ("ptScreenPos", POINT),
+            ]
+        
+        ci = CURSORINFO()
+        ci.cbSize = ctypes.sizeof(CURSORINFO)
+        if not ctypes.windll.user32.GetCursorInfo(ctypes.byref(ci)):
+            return None
+        
+        if not ci.hCursor:
+            return None
+        
+        # 获取光标信息（包括热点位置）
+        class ICONINFO(ctypes.Structure):
+            _fields_ = [
+                ("fIcon", ctypes.c_int),
+                ("xHotspot", ctypes.c_int),
+                ("yHotspot", ctypes.c_int),
+                ("hbmMask", ctypes.c_void_p),
+                ("hbmColor", ctypes.c_void_p),
+            ]
+        
+        icon_info = ICONINFO()
+        if not ctypes.windll.user32.GetIconInfo(ctypes.c_void_p(ci.hCursor), ctypes.byref(icon_info)):
+            return None
+        
+        hotspot_x = icon_info.xHotspot
+        hotspot_y = icon_info.yHotspot
+        
+        # 尝试使用 Windows API 获取光标图像
+        # 由于直接使用 Windows GDI 与 Qt 集成较复杂，我们创建一个简单的光标图像
+        # 实际应用中，可以使用更复杂的方法来获取真实光标图像
+        
+        # 创建一个简单的光标图像（箭头形状）
+        cursor_size = 32
+        cursor_pix = QPixmap(cursor_size, cursor_size)
+        cursor_pix.fill(Qt.transparent)
+        painter = QPainter(cursor_pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        # 绘制一个标准的箭头光标
+        # 主箭头线
+        pen = QPen(QColor(0, 0, 0), 2.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        # 垂直线
+        painter.drawLine(4, 4, 4, 20)
+        # 箭头头部
+        path = QPainterPath()
+        path.moveTo(4, 4)
+        path.lineTo(12, 10)
+        path.lineTo(8, 10)
+        path.lineTo(8, 16)
+        path.lineTo(4, 20)
+        path.closeSubpath()
+        painter.fillPath(path, QColor(0, 0, 0))
+        
+        # 白色高光
+        pen = QPen(QColor(255, 255, 255), 1.5)
+        painter.setPen(pen)
+        painter.drawLine(5, 5, 5, 19)
+        painter.drawLine(5, 5, 11, 10)
+        painter.drawLine(5, 5, 7, 10)
+        
+        painter.end()
+        
+        return (cursor_x, cursor_y, cursor_pix, hotspot_x, hotspot_y)
+    except Exception:
+        return None
+
+
+def draw_cursor_on_pixmap(pix: QPixmap, rect: QRect, cursor_info):
+    """在 QPixmap 上绘制鼠标光标（如果光标在区域内）"""
+    if cursor_info is None:
+        return pix
+    
+    cursor_x, cursor_y, cursor_pix, hotspot_x, hotspot_y = cursor_info
+    
+    # 检查光标是否在录制区域内
+    if not rect.contains(QPoint(cursor_x, cursor_y)):
+        return pix
+    
+    # 计算光标在图像中的相对位置
+    rel_x = cursor_x - rect.left()
+    rel_y = cursor_y - rect.top()
+    
+    # 确保位置在图像范围内
+    if rel_x < 0 or rel_y < 0 or rel_x >= pix.width() or rel_y >= pix.height():
+        return pix
+    
+    # 创建新的 pixmap 并绘制光标
+    result_pix = QPixmap(pix)
+    painter = QPainter(result_pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+    
+    # 绘制光标（调整位置以考虑热点）
+    draw_x = rel_x - hotspot_x
+    draw_y = rel_y - hotspot_y
+    
+    painter.drawPixmap(draw_x, draw_y, cursor_pix)
+    painter.end()
+    
+    return result_pix
+
+
+def draw_cursor_on_numpy_array(arr: np.ndarray, rect: QRect, cursor_info):
+    """在 numpy 数组上绘制鼠标光标（如果光标在区域内）"""
+    if cursor_info is None:
+        return arr
+    
+    cursor_x, cursor_y, cursor_pix, hotspot_x, hotspot_y = cursor_info
+    
+    # 检查光标是否在录制区域内
+    if not rect.contains(QPoint(cursor_x, cursor_y)):
+        return arr
+    
+    # 将 QPixmap 转换为 numpy 数组并合成
+    try:
+        _ensure_numpy()
+        # 计算光标在图像中的相对位置
+        rel_x = cursor_x - rect.left()
+        rel_y = cursor_y - rect.top()
+        
+        # 确保位置在图像范围内
+        h, w = arr.shape[:2]
+        if rel_x < 0 or rel_y < 0 or rel_x >= w or rel_y >= h:
+            return arr
+        
+        # 将光标 pixmap 转换为 numpy 数组
+        cursor_img = cursor_pix.toImage().convertToFormat(QImage.Format_RGBA8888)
+        cursor_w = cursor_img.width()
+        cursor_h = cursor_img.height()
+        cursor_buf = cursor_img.bits()
+        try:
+            cursor_raw = cursor_buf.tobytes()
+        except Exception:
+            try:
+                cursor_buf.setsize(cursor_img.byteCount())
+                cursor_raw = bytes(cursor_buf)
+            except Exception:
+                cursor_line_bytes = cursor_img.bytesPerLine()
+                cursor_raw = b"".join(bytes(cursor_img.scanLine(i))[:cursor_line_bytes] for i in range(cursor_h))
+        
+        cursor_arr = np.frombuffer(cursor_raw, dtype=np.uint8).reshape((cursor_h, cursor_w, 4))
+        
+        # 计算绘制位置（考虑热点）
+        draw_x = rel_x - hotspot_x
+        draw_y = rel_y - hotspot_y
+        
+        # 确保绘制区域在图像范围内
+        x1 = max(0, draw_x)
+        y1 = max(0, draw_y)
+        x2 = min(w, draw_x + cursor_w)
+        y2 = min(h, draw_y + cursor_h)
+        
+        # 计算光标图像中对应的区域
+        cursor_x1 = x1 - draw_x
+        cursor_y1 = y1 - draw_y
+        cursor_x2 = cursor_x1 + (x2 - x1)
+        cursor_y2 = cursor_y1 + (y2 - y1)
+        
+        # Alpha 混合合成光标
+        cursor_region = cursor_arr[cursor_y1:cursor_y2, cursor_x1:cursor_x2]
+        alpha = cursor_region[:, :, 3:4] / 255.0
+        rgb = cursor_region[:, :, :3]
+        
+        # 合成到目标图像
+        arr[y1:y2, x1:x2] = (arr[y1:y2, x1:x2] * (1 - alpha) + rgb * alpha).astype(np.uint8)
+        
+    except Exception:
+        pass
+    
+    return arr
+
+
 def _wheel_scroll(delta: int):
     try:
         WM_MOUSEWHEEL = 0x020A
@@ -2069,6 +2261,10 @@ class RecorderWindow(QMainWindow):
     def _capture_frame(self):
         try:
             pix = capture_region(self.rect)
+            # 获取鼠标光标信息并绘制到图像上
+            cursor_info = get_cursor_info()
+            if cursor_info:
+                pix = draw_cursor_on_pixmap(pix, self.rect, cursor_info)
             arr = qpixmap_to_np_rgb(pix)
             if self._writer is not None:
                 try:
@@ -2642,6 +2838,8 @@ class GifRecorderWindow(QMainWindow):
             self._tmp_gif_path = None
 
     def _capture_frame(self):
+        # 获取鼠标光标信息
+        cursor_info = get_cursor_info()
         try:
             screen = QGuiApplication.screenAt(self.rect.center())
             if screen is None:
@@ -2656,6 +2854,9 @@ class GifRecorderWindow(QMainWindow):
             if y < 0:
                 y = 0
             pix = screen.grabWindow(0, x, y, w, h)
+            # 在 pixmap 上绘制鼠标光标
+            if cursor_info:
+                pix = draw_cursor_on_pixmap(pix, self.rect, cursor_info)
             img = pix.toImage().convertToFormat(QImage.Format_RGB888)
             w = img.width()
             h = img.height()
@@ -2682,6 +2883,9 @@ class GifRecorderWindow(QMainWindow):
                 try:
                     shot = sct.grab(self._bbox())
                     frame = np.array(shot)[:, :, :3][:, :, ::-1]
+                    # 在 numpy 数组上绘制鼠标光标
+                    if cursor_info:
+                        frame = draw_cursor_on_numpy_array(frame, self.rect, cursor_info)
                     if self._writer is not None:
                         try:
                             self._writer.append_data(frame)
